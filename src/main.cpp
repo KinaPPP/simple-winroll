@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.2.0
+// シンプル WinRoll ver 1.3.0
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -20,6 +20,7 @@
 #include <shobjidl.h>
 #include <propkey.h>
 #include <propvarutil.h>
+#include <shellscalingapi.h>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -32,10 +33,11 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.2.0";
+static const wchar_t* APP_VERSION   = L"1.3.0";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
+static const wchar_t* SPLASH_CLASS  = L"SimpleWinRoll.KINA.Splash";
 static const wchar_t* MUTEX_NAME    = L"Local\\SimpleWinRoll.KINA.Instance";
 static const wchar_t* RUN_KEY       = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t* RUN_VALUE     = L"SimpleWinRoll";
@@ -82,6 +84,7 @@ struct Settings {
     bool hideIcon  = false;
     bool noMiddle  = false;   // don't use the middle mouse button (Shift+Right still works)
     bool trayAsMenu = false;  // tray-minimized windows: false = own icon, true = listed in our menu
+    bool showSplash = true;   // splash screen on every start (auto-start included)
 };
 
 struct Rolled {
@@ -165,6 +168,7 @@ static void LoadSettings() {
     g_set.hideIcon  = GetPrivateProfileIntW(L"startup", L"hideIcon", 0, ini.c_str()) != 0;
     g_set.noMiddle  = GetPrivateProfileIntW(L"mouse", L"noMiddle", 0, ini.c_str()) != 0;
     g_set.trayAsMenu = GetPrivateProfileIntW(L"tray", L"asMenu", 0, ini.c_str()) != 0;
+    g_set.showSplash = GetPrivateProfileIntW(L"startup", L"splash", 1, ini.c_str()) != 0;
 }
 
 static void SaveSettings() {
@@ -177,6 +181,7 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"startup", L"hideIcon", g_set.hideIcon ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"mouse", L"noMiddle", g_set.noMiddle ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"tray", L"asMenu", g_set.trayAsMenu ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"startup", L"splash", g_set.showSplash ? L"1" : L"0", ini.c_str());
 }
 
 static void ApplyAutoStart() {
@@ -1062,7 +1067,7 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
 // Panel windows (settings / operations list) — owner drawn, scalable
 // ---------------------------------------------------------------------------
 enum ItemKind { K_CARD, K_HEAD, K_TEXT, K_TEXT_BOLD, K_TEXT_MUTED, K_CHECK, K_SEG, K_BTN, K_BTN_PRIMARY, K_LINK, K_TROW, K_THEAD, K_FOOTER, K_RADIO };
-enum ItemId { I_NONE, I_SEG, I_FOLLOW, I_AUTO, I_HIDE, I_OK, I_CANCEL, I_ABOUT, I_CLOSE, I_GITHUB, I_NOMIDDLE, I_TRAY_ICON, I_TRAY_MENU };
+enum ItemId { I_NONE, I_SEG, I_FOLLOW, I_AUTO, I_HIDE, I_OK, I_CANCEL, I_ABOUT, I_CLOSE, I_GITHUB, I_NOMIDDLE, I_TRAY_ICON, I_TRAY_MENU, I_SPLASH };
 
 struct Item {
     ItemKind kind; RECT rc; std::wstring text, sub; int id = I_NONE; int value = 0;
@@ -1086,7 +1091,7 @@ static Item MkItem(ItemKind k, int x, int y, int w, int h, const std::wstring& t
 static void BuildSettings(Panel* p) {
     p->items.clear();
     const Settings& s = p->temp;
-    int W = 440, x = 16, cw = W - 32, y = 16;
+    int W = 480, x = 16, cw = W - 32, y = 16;
 
     // 表示サイズ
     int cy = y;
@@ -1105,12 +1110,13 @@ static void BuildSettings(Panel* p) {
 
     // 起動
     cy = y;
-    p->items.push_back(MkItem(K_CARD, x, cy, cw, 104));
+    p->items.push_back(MkItem(K_CARD, x, cy, cw, 134));
     p->items.push_back(MkItem(K_HEAD, x + 14, cy + 12, cw - 28, 18, L"起動"));
     Item a = MkItem(K_CHECK, x + 14, cy + 38, cw - 28, 24, L"Windowsの起動時に自動で起動する", I_AUTO); a.on = s.autoStart;
     Item h = MkItem(K_CHECK, x + 14, cy + 68, cw - 28, 24, L"トレイアイコンを隠す（もう一度起動すると再表示）", I_HIDE); h.on = s.hideIcon;
-    p->items.push_back(a); p->items.push_back(h);
-    y = cy + 104 + 12;
+    Item sp = MkItem(K_CHECK, x + 14, cy + 98, cw - 28, 24, L"起動時にスプラッシュ画面を表示する（自動起動のときも）", I_SPLASH); sp.on = s.showSplash;
+    p->items.push_back(a); p->items.push_back(h); p->items.push_back(sp);
+    y = cy + 134 + 12;
 
     // 操作
     cy = y;
@@ -1395,6 +1401,7 @@ static void PanelActivate(HWND hwnd, Panel* p, int id, int value) {
     case I_FOLLOW: p->temp.followDpi = !p->temp.followDpi; BuildSettings(p); ResizePanel(hwnd, p); break;
     case I_AUTO: p->temp.autoStart = !p->temp.autoStart; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
     case I_HIDE: p->temp.hideIcon = !p->temp.hideIcon; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
+    case I_SPLASH: p->temp.showSplash = !p->temp.showSplash; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
     case I_NOMIDDLE: p->temp.noMiddle = !p->temp.noMiddle; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
     case I_TRAY_ICON: p->temp.trayAsMenu = false; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
     case I_TRAY_MENU: p->temp.trayAsMenu = true; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
@@ -1496,6 +1503,132 @@ static void ShowAbout() {
     if (g_aboutWnd) { ShowWindow(g_aboutWnd, SW_RESTORE); SetForegroundWindow(g_aboutWnd); return; }
     Panel* p = new Panel(); p->isSettings = false; BuildAbout(p);
     g_aboutWnd = CreatePanel(p, L"シンプル WinRoll — 操作一覧");
+}
+
+// ---------------------------------------------------------------------------
+// Splash screen
+// ---------------------------------------------------------------------------
+static const int SPLASH_W = 440, SPLASH_H = 212;
+static const DWORD SPLASH_MS = 3000, SPLASH_FADE_MS = 400;
+static const UINT_PTR SPLASH_TIMER = 3;
+struct Splash { DWORD start; double scale; HFONT fTitle, fN, fB, fS; HICON icon; };
+
+static void PaintSplash(HWND hwnd, Splash* sp) {
+    PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+    RECT cr; GetClientRect(hwnd, &cr);
+    double s = sp->scale;
+    auto S = [s](double v) { return (int)(v * s + 0.5); };
+    HDC dc = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, cr.right, cr.bottom);
+    HGDIOBJ ob = SelectObject(dc, bmp);
+    HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(dc, &cr, bg); DeleteObject(bg);
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        RECT box = { S(24), S(106), S(SPLASH_W - 24), S(168) };
+        FillRound(g, box, 6 * (float)s, C_PANEL, C_BORDER);
+        g.Flush();
+    }
+    if (sp->icon) DrawIconEx(dc, S(24), S(24), sp->icon, S(64), S(64), 0, nullptr, DI_NORMAL);
+    RECT t = { S(106), S(28), S(SPLASH_W - 24), S(60) };
+    DrawTextIn(dc, APP_NAME, t, sp->fTitle, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT v = { S(106), S(62), S(SPLASH_W - 24), S(84) };
+    DrawTextIn(dc, std::wstring(L"ver ") + APP_VERSION + L"　／　作者：KINA", v, sp->fN, C_SUB, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // "タイトルバーを" + bold "右クリック" + "でウィンドウを巻き上げます。"
+    const wchar_t* parts[3] = { L"タイトルバーを", L"右クリック", L"でウィンドウを巻き上げます。" };
+    int x = S(38), y1 = S(116), lh = S(20);
+    for (int i = 0; i < 3; i++) {
+        HFONT f = (i == 1) ? sp->fB : sp->fN;
+        HGDIOBJ o = SelectObject(dc, f);
+        SIZE sz; GetTextExtentPoint32W(dc, parts[i], (int)wcslen(parts[i]), &sz);
+        SelectObject(dc, o);
+        RECT r = { x, y1, x + sz.cx + 2, y1 + lh };
+        DrawTextIn(dc, parts[i], r, f, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        x += sz.cx;
+    }
+    RECT l2 = { S(38), S(138), S(SPLASH_W - 38), S(158) };
+    DrawTextIn(dc, L"設定と操作一覧は、タスクトレイのアイコンから開けます。", l2, sp->fN, C_SUB, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    RECT f1 = { S(24), S(180), S(SPLASH_W - 24), S(200) };
+    DrawTextIn(dc, L"WinRoll（© 2003–2004 Wil Palma）をマジ！リスペクト！！", f1, sp->fS, C_SUB, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(dc, L"クリックで閉じる", f1, sp->fS, C_SUB, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+    // progress line
+    DWORD el = GetTickCount() - sp->start;
+    double prog = el >= SPLASH_MS ? 1.0 : el / (double)SPLASH_MS;
+    int ph = S(3) < 2 ? 2 : S(3);
+    RECT track = { 0, cr.bottom - ph, cr.right, cr.bottom };
+    HBRUSH tb = CreateSolidBrush(C_HOVER); FillRect(dc, &track, tb); DeleteObject(tb);
+    RECT bar = { 0, cr.bottom - ph, (int)(cr.right * prog), cr.bottom };
+    HBRUSH bb = CreateSolidBrush(C_BLUE); FillRect(dc, &bar, bb); DeleteObject(bb);
+
+    BitBlt(hdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, ob); DeleteObject(bmp); DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+static LRESULT CALLBACK SplashProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Splash* sp = (Splash*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)lp)->lpCreateParams);
+        break;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: if (sp) { PaintSplash(hwnd, sp); return 0; } break;
+    case WM_TIMER:
+        if (wp == SPLASH_TIMER && sp) {
+            DWORD el = GetTickCount() - sp->start;
+            if (el >= SPLASH_MS + SPLASH_FADE_MS) { DestroyWindow(hwnd); return 0; }
+            if (el > SPLASH_MS) {
+                BYTE a = (BYTE)(255 - 255.0 * (el - SPLASH_MS) / SPLASH_FADE_MS);
+                SetLayeredWindowAttributes(hwnd, 0, a, LWA_ALPHA);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_DESTROY: KillTimer(hwnd, SPLASH_TIMER); return 0;
+    case WM_NCDESTROY:
+        if (sp) {
+            DeleteObject(sp->fTitle); DeleteObject(sp->fN); DeleteObject(sp->fB); DeleteObject(sp->fS);
+            if (sp->icon) DestroyIcon(sp->icon);
+            delete sp;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowSplash() {
+    POINT cur; GetCursorPos(&cur);
+    HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
+    double s;
+    if (g_set.followDpi) { UINT dx = 96, dy = 96; GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy); s = dx / 96.0; }
+    else s = g_set.sizePct / 100.0;
+    Splash* sp = new Splash();
+    sp->start = GetTickCount(); sp->scale = s;
+    sp->fTitle = MakeFont(22 * s, true); sp->fN = MakeFont(13 * s, false);
+    sp->fB = MakeFont(13 * s, true); sp->fS = MakeFont(11 * s, false);
+    int is = (int)(64 * s + 0.5);
+    sp->icon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, is, is, 0);
+    int w = (int)(SPLASH_W * s + 0.5), h = (int)(SPLASH_H * s + 0.5);
+    int x = (mi.rcWork.left + mi.rcWork.right - w) / 2, y = (mi.rcWork.top + mi.rcWork.bottom - h) / 2;
+    HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE, SPLASH_CLASS, APP_NAME,
+                              WS_POPUP, x, y, w, h, nullptr, nullptr, g_inst, sp);
+    if (!hw) { delete sp; return; }
+    SetLayeredWindowAttributes(hw, 0, 255, LWA_ALPHA);
+    DWORD pref = 2; // DWMWCP_ROUND
+    DwmSetWindowAttribute(hw, 33, &pref, sizeof(pref));
+    COLORREF bc = C_BORDER;
+    DwmSetWindowAttribute(hw, 34, &bc, sizeof(bc));
+    ShowWindow(hw, SW_SHOWNOACTIVATE);
+    SetTimer(hw, SPLASH_TIMER, 30, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,6 +1810,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     pc.lpfnWndProc = PanelProc; pc.lpszClassName = PANEL_CLASS; pc.hIcon = g_appIconBig; pc.hIconSm = g_appIconSmall;
     RegisterClassExW(&pc);
 
+    WNDCLASSEXW sc = { sizeof(sc) };
+    sc.hInstance = hInst; sc.hCursor = LoadCursor(nullptr, IDC_HAND);
+    sc.lpfnWndProc = SplashProc; sc.lpszClassName = SPLASH_CLASS; sc.style = CS_DROPSHADOW;
+    RegisterClassExW(&sc);
+
     g_main = CreateWindowExW(WS_EX_TOOLWINDOW, MAIN_CLASS, L"Simple WinRoll", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     ChangeWindowMessageFilterEx(g_main, g_msgTaskbarCreated, MSGFLT_ALLOW, nullptr);
@@ -1688,6 +1826,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (!g_mouseHook) {
         MessageBoxW(nullptr, L"マウスの監視を開始できませんでした。", APP_NAME, MB_ICONERROR);
     }
+    if (g_set.showSplash) ShowSplash();
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
