@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.3.0
+// シンプル WinRoll ver 1.3.1
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -33,11 +33,12 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.3.0";
+static const wchar_t* APP_VERSION   = L"1.3.1";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
 static const wchar_t* SPLASH_CLASS  = L"SimpleWinRoll.KINA.Splash";
+static const wchar_t* NOTICE_CLASS  = L"SimpleWinRoll.KINA.Notice";
 static const wchar_t* MUTEX_NAME    = L"Local\\SimpleWinRoll.KINA.Instance";
 static const wchar_t* RUN_KEY       = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t* RUN_VALUE     = L"SimpleWinRoll";
@@ -608,6 +609,84 @@ static void UnrollAll() {
 }
 
 // ---------------------------------------------------------------------------
+// Small notice shown near the mouse (e.g. why translucency did not work)
+// ---------------------------------------------------------------------------
+struct Notice { std::wstring l1, l2; bool openColors; DWORD start; double scale; HFONT fB, fN; };
+static HWND g_notice;
+static const UINT_PTR NOTICE_TIMER = 4;
+static const DWORD NOTICE_MS = 4000;
+
+static LRESULT CALLBACK NoticeProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Notice* n = (Notice*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)lp)->lpCreateParams);
+        break;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: if (n) {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+        RECT cr; GetClientRect(hwnd, &cr);
+        double s = n->scale;
+        HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(hdc, &cr, bg); DeleteObject(bg);
+        int is = (int)(16 * s + 0.5);
+        DrawIconEx(hdc, (int)(14 * s), (int)(14 * s), g_appIconSmall, is, is, 0, nullptr, DI_NORMAL);
+        RECT r1 = { (int)(40 * s), (int)(10 * s), cr.right - (int)(12 * s), (int)(32 * s) };
+        DrawTextIn(hdc, n->l1, r1, n->fB, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        RECT r2 = { (int)(40 * s), (int)(32 * s), cr.right - (int)(12 * s), (int)(54 * s) };
+        DrawTextIn(hdc, n->l2, r2, n->fN, C_SUB, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        EndPaint(hwnd, &ps);
+        return 0; }
+        break;
+    case WM_TIMER:
+        if (wp == NOTICE_TIMER) DestroyWindow(hwnd);
+        return 0;
+    case WM_LBUTTONDOWN:
+        if (n && n->openColors) ShellExecuteW(nullptr, L"open", L"ms-settings:colors", nullptr, nullptr, SW_SHOWNORMAL);
+        DestroyWindow(hwnd);
+        return 0;
+    case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: DestroyWindow(hwnd); return 0;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_DESTROY: KillTimer(hwnd, NOTICE_TIMER); if (g_notice == hwnd) g_notice = nullptr; return 0;
+    case WM_NCDESTROY:
+        if (n) { DeleteObject(n->fB); DeleteObject(n->fN); delete n; SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0); }
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowNotice(const std::wstring& l1, const std::wstring& l2, bool openColors) {
+    if (g_notice) DestroyWindow(g_notice);
+    POINT cur; GetCursorPos(&cur);
+    HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
+    UINT dx = 96, dy = 96; GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy);
+    double s = g_set.followDpi ? dx / 96.0 : g_set.sizePct / 100.0;
+    Notice* n = new Notice();
+    n->l1 = l1; n->l2 = l2; n->openColors = openColors; n->start = GetTickCount(); n->scale = s;
+    n->fB = MakeFont(13 * s, true); n->fN = MakeFont(12 * s, false);
+    // width to fit the longer line
+    HDC dc = GetDC(nullptr);
+    HGDIOBJ o = SelectObject(dc, n->fB); SIZE a; GetTextExtentPoint32W(dc, l1.c_str(), (int)l1.size(), &a);
+    SelectObject(dc, n->fN); SIZE b; GetTextExtentPoint32W(dc, l2.c_str(), (int)l2.size(), &b);
+    SelectObject(dc, o); ReleaseDC(nullptr, dc);
+    int w = (a.cx > b.cx ? a.cx : b.cx) + (int)(56 * s), h = (int)(64 * s);
+    int maxW = (mi.rcWork.right - mi.rcWork.left) - 20; if (w > maxW) w = maxW;
+    int x = cur.x + (int)(12 * s), y = cur.y + (int)(18 * s);
+    if (x + w > mi.rcWork.right) x = mi.rcWork.right - w - 4;
+    if (y + h > mi.rcWork.bottom) y = cur.y - h - (int)(8 * s);
+    if (x < mi.rcWork.left) x = mi.rcWork.left + 4;
+    HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, NOTICE_CLASS, APP_NAME, WS_POPUP,
+                              x, y, w, h, nullptr, nullptr, g_inst, n);
+    if (!hw) { DeleteObject(n->fB); DeleteObject(n->fN); delete n; MessageBeep(MB_OK); return; }
+    DWORD pref = 3; DwmSetWindowAttribute(hw, 33, &pref, sizeof(pref));
+    COLORREF bc = C_BORDER; DwmSetWindowAttribute(hw, 34, &bc, sizeof(bc));
+    ShowWindow(hw, SW_SHOWNOACTIVATE);
+    SetTimer(hw, NOTICE_TIMER, NOTICE_MS, nullptr);
+    g_notice = hw;
+    MessageBeep(MB_OK);
+}
+
+// ---------------------------------------------------------------------------
 // Other modes: translucency, back / top, tray, all windows
 // ---------------------------------------------------------------------------
 static bool TransparencyEnabled() {   // Settings > Personalization > Colors > Transparency effects
@@ -650,14 +729,20 @@ static void RestoreAllTranslucent() {
 static void ToggleTranslucent(HWND h) {
     int i = FindTrans(h);
     if (i >= 0) { RemoveTranslucent(i); SaveRolledState(); return; }
-    if (!TransparencyEnabled()) { MessageBeep(MB_OK); return; }   // follow Windows' own setting
+    if (!TransparencyEnabled()) {   // follow Windows' own setting
+        ShowNotice(L"透明効果がオフのため、半透明にできません",
+                   L"個人用設定 → 色 →「透明効果」をオンにしてください（クリックで設定を開く）", true);
+        return;
+    }
     Translucent a; a.h = h; GetWindowThreadProcessId(h, &a.pid);
     LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
     if (ex & WS_EX_LAYERED) {
         BYTE alpha = 255; DWORD fl = 0; COLORREF key = 0;
         // Windows drawn with UpdateLayeredWindow cannot be changed this way.
-        if (!GetLayeredWindowAttributes(h, &key, &alpha, &fl)) { MessageBeep(MB_OK); return; }
-        if ((fl & LWA_ALPHA) && alpha < 255) { MessageBeep(MB_OK); return; }   // already translucent by the app itself
+        if (!GetLayeredWindowAttributes(h, &key, &alpha, &fl) || ((fl & LWA_ALPHA) && alpha < 255)) {
+            ShowNotice(L"このウィンドウは半透明にできません", L"アプリが独自の方法で透明度を扱っています", false);
+            return;
+        }
         a.key = key; a.flags = fl & LWA_COLORKEY;
     } else {
         SetWindowLongPtrW(h, GWL_EXSTYLE, ex | WS_EX_LAYERED);
@@ -665,7 +750,7 @@ static void ToggleTranslucent(HWND h) {
     }
     if (!SetLayeredWindowAttributes(h, a.key, TRANSLUCENT_ALPHA, a.flags | LWA_ALPHA)) {
         if (a.addedLayered) SetWindowLongPtrW(h, GWL_EXSTYLE, ex);
-        MessageBeep(MB_OK);
+        ShowNotice(L"このウィンドウは半透明にできません", L"アプリ側が外からの変更を受け付けていません", false);
         return;
     }
     g_trans.push_back(a);
@@ -1814,6 +1899,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     sc.hInstance = hInst; sc.hCursor = LoadCursor(nullptr, IDC_HAND);
     sc.lpfnWndProc = SplashProc; sc.lpszClassName = SPLASH_CLASS; sc.style = CS_DROPSHADOW;
     RegisterClassExW(&sc);
+
+    WNDCLASSEXW nc = { sizeof(nc) };
+    nc.hInstance = hInst; nc.hCursor = LoadCursor(nullptr, IDC_HAND);
+    nc.lpfnWndProc = NoticeProc; nc.lpszClassName = NOTICE_CLASS; nc.style = CS_DROPSHADOW;
+    RegisterClassExW(&nc);
 
     g_main = CreateWindowExW(WS_EX_TOOLWINDOW, MAIN_CLASS, L"Simple WinRoll", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
