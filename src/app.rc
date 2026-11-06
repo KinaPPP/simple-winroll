@@ -5,8 +5,8 @@
 1 RT_MANIFEST "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,3,2,0
-PRODUCTVERSION  1,3,2,0
+FILEVERSION     1,3,3,0
+PRODUCTVERSION  1,3,3,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -19,12 +19,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "KINA"
             VALUE "FileDescription",  "シンプル WinRoll"
-            VALUE "FileVersion",      "1.3.2"
+            VALUE "FileVersion",      "1.3.3"
             VALUE "InternalName",     "simple-winroll"
             VALUE "LegalCopyright",   "© 2026 KINA"
             VALUE "OriginalFilename", "simple-winroll.exe"
             VALUE "ProductName",      "シンプル WinRoll"
-            VALUE "ProductVersion",   "1.3.2"
+            VALUE "ProductVersion",   "1.3.3"
         END
     END
     BLOCK "VarFileInfo"

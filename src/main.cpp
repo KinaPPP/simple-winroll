@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.3.2
+// シンプル WinRoll ver 1.3.3
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.3.2";
+static const wchar_t* APP_VERSION   = L"1.3.3";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -477,6 +477,9 @@ static void RecoverFromPreviousRun() {
             SetLayeredWindowAttributes(h, key, 255, fl);
             if (added) SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) & ~WS_EX_LAYERED);
         } else if (!IsWindowVisible(h)) {
+            // Bring it back in front of everything (without taking focus) so it is clearly visible again.
+            SetWindowPos(h, HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
             ShowWindowAsync(h, SW_SHOWNA);
         }
     }
