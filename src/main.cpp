@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.3.5
+// シンプル WinRoll ver 1.4.0
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,12 +34,13 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.3.5";
+static const wchar_t* APP_VERSION   = L"1.4.0";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
 static const wchar_t* SPLASH_CLASS  = L"SimpleWinRoll.KINA.Splash";
 static const wchar_t* NOTICE_CLASS  = L"SimpleWinRoll.KINA.Notice";
+static const wchar_t* GUIDE_CLASS   = L"SimpleWinRoll.KINA.Guide";
 static const wchar_t* MUTEX_NAME    = L"Local\\SimpleWinRoll.KINA.Instance";
 static const wchar_t* RUN_KEY       = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t* RUN_VALUE     = L"SimpleWinRoll";
@@ -56,6 +57,7 @@ enum {
     ID_TRAY = 1,
     IDM_SETTINGS = 100, IDM_ABOUT, IDM_RESTOREALL, IDM_EXIT,
     IDM_TW_RESTORE = 300, IDM_TW_CLOSE,
+    IDM_ENABLE = 400, IDM_VERSION,
     IDM_TRAYED_BASE = 1000,          // + index (tray "menu" mode)
 };
 enum Action { A_ROLL = 1, A_ROLL_ALL, A_TRANSLUCENT, A_BACK, A_TOPMOST, A_TRAY, A_MIN_ALL, A_MAX_ALL, A_CLOSE_ALL };
@@ -75,6 +77,7 @@ static const UINT_PTR BAR_TIMER = 1;
 #define C_BLUE_HV  RGB(0x3a,0x7b,0xd5)
 #define C_BLUE_ACT RGB(0x2d,0x6a,0xbf)
 #define C_HOVER    RGB(0xec,0xec,0xec)
+#define C_RED      RGB(0xdc,0x26,0x26)
 
 // ---------------------------------------------------------------------------
 // Globals
@@ -110,6 +113,8 @@ static HHOOK g_mouseHook;              // owned by the hook thread
 static DWORD g_hookThreadId;
 static HANDLE g_hookThread;
 static std::atomic<bool> g_noMiddleFlag{false};   // copy of g_set.noMiddle for the hook thread
+static std::atomic<bool> g_enabled{true};         // tray menu "有効": when off, every click passes through
+static HICON g_grayIconSmall;                     // tray icon while paused
 static Settings g_set;
 static std::vector<Rolled*> g_rolled;
 static bool g_trayShown = false;
@@ -1162,7 +1167,7 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION) {
         auto* m = (MSLLHOOKSTRUCT*)lp;
         if (swallowUp && wp == swallowUp) { swallowUp = 0; return 1; }
-        if (!(m->flags & LLMHF_INJECTED) && (wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN || wp == WM_LBUTTONDOWN)) {
+        if (g_enabled && !(m->flags & LLMHF_INJECTED) && (wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN || wp == WM_LBUTTONDOWN)) {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             bool alt   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
             bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
@@ -1763,6 +1768,203 @@ static void ShowSplash() {
 }
 
 // ---------------------------------------------------------------------------
+// Version information with a hidden manual (like the original WinRoll's About):
+// hover over the drawn title bar or its buttons to see what each click does.
+// The title bar is only a drawing, so Windows 11 snap layouts never appear.
+// ---------------------------------------------------------------------------
+static const int GUIDE_W = 480, GUIDE_H = 290, GUIDE_BAR = 36, GUIDE_BTN = 46;
+enum GuidePart { GP_NONE, GP_TITLE, GP_MIN, GP_MAX, GP_CLOSE };
+struct Guide { double scale; int part; HFONT fTitle, fN, fB, fS, fSB; HICON icon; };
+static HWND g_guideWnd;
+
+static int GuideHit(Guide* g, int x, int y) {
+    double s = g->scale;
+    int W = (int)(GUIDE_W * s + 0.5), bar = (int)(GUIDE_BAR * s + 0.5), bw = (int)(GUIDE_BTN * s + 0.5);
+    if (y < 0 || y >= bar) return GP_NONE;
+    if (x >= W - bw) return GP_CLOSE;
+    if (x >= W - bw * 2) return GP_MAX;
+    if (x >= W - bw * 3) return GP_MIN;
+    return GP_TITLE;
+}
+
+static void PaintGuide(HWND hwnd, Guide* gd) {
+    PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+    RECT cr; GetClientRect(hwnd, &cr);
+    double s = gd->scale;
+    auto S = [s](double v) { return (int)(v * s + 0.5); };
+    HDC dc = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, cr.right, cr.bottom);
+    HGDIOBJ ob = SelectObject(dc, bmp);
+    HBRUSH bg = CreateSolidBrush(C_CARD); FillRect(dc, &cr, bg); DeleteObject(bg);
+
+    // drawn title bar
+    int W = cr.right, bar = S(GUIDE_BAR), bw = S(GUIDE_BTN);
+    RECT tb = { 0, 0, W, bar };
+    HBRUSH tbb = CreateSolidBrush(gd->part == GP_TITLE ? RGB(0xee,0xf4,0xfc) : C_PANEL); FillRect(dc, &tb, tbb); DeleteObject(tbb);
+    RECT line = { 0, bar - 1, W, bar };
+    HBRUSH lb = CreateSolidBrush(C_BORDER); FillRect(dc, &line, lb); DeleteObject(lb);
+    int is = S(16);
+    if (g_appIconSmall) DrawIconEx(dc, S(12), (bar - is) / 2, g_appIconSmall, is, is, 0, nullptr, DI_NORMAL);
+    RECT tt = { S(36), 0, W - bw * 3, bar - 1 };
+    DrawTextIn(dc, APP_NAME, tt, gd->fN, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    for (int i = 0; i < 3; i++) {
+        int part = GP_MIN + i;
+        RECT br = { W - bw * (3 - i), 0, W - bw * (2 - i), bar - 1 };
+        bool hov = gd->part == part;
+        if (hov) {
+            HBRUSH hb = CreateSolidBrush(part == GP_CLOSE ? C_RED : RGB(0xe2,0xe2,0xe2)); FillRect(dc, &br, hb); DeleteObject(hb);
+        }
+        COLORREF fg = (hov && part == GP_CLOSE) ? RGB(255,255,255) : C_TEXT;
+        HPEN pen = CreatePen(PS_SOLID, s >= 1.5 ? 2 : 1, fg); HGDIOBJ op = SelectObject(dc, pen);
+        HGDIOBJ obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        int cx = (br.left + br.right) / 2, cy = (br.top + br.bottom) / 2, h = S(5);
+        if (part == GP_MIN) { MoveToEx(dc, cx - h, cy, nullptr); LineTo(dc, cx + h + 1, cy); }
+        else if (part == GP_MAX) { Rectangle(dc, cx - h, cy - h, cx + h + 1, cy + h + 1); }
+        else { MoveToEx(dc, cx - h, cy - h, nullptr); LineTo(dc, cx + h + 1, cy + h + 1);
+               MoveToEx(dc, cx + h, cy - h, nullptr); LineTo(dc, cx - h - 1, cy + h + 1); }
+        SelectObject(dc, obr); SelectObject(dc, op); DeleteObject(pen);
+    }
+
+    // header
+    if (gd->icon) DrawIconEx(dc, S(22), bar + S(16), gd->icon, S(56), S(56), 0, nullptr, DI_NORMAL);
+    RECT t1 = { S(94), bar + S(18), W - S(22), bar + S(48) };
+    DrawTextIn(dc, APP_NAME, t1, gd->fTitle, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT t2 = { S(94), bar + S(48), W - S(22), bar + S(68) };
+    DrawTextIn(dc, std::wstring(L"ver ") + APP_VERSION + L"　／　作者：KINA", t2, gd->fN, C_SUB, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // help box
+    struct L { const wchar_t* op; const wchar_t* act; };
+    const wchar_t* head = L"タイトルバーやボタンにマウスを合わせると、使い方が表示されます";
+    std::vector<L> lines;
+    switch (gd->part) {
+    case GP_TITLE: head = L"タイトルバー"; lines = {
+        { L"右クリック", L"ウィンドウを巻き上げる／元に戻す" }, { L"中クリック（Shift＋右）", L"半透明にする／元に戻す" },
+        { L"Shift＋左クリック", L"いちばん後ろへ送る" }, { L"Alt＋右クリック", L"すべて巻き上げる" } }; break;
+    case GP_MIN: head = L"最小化ボタン"; lines = {
+        { L"左クリック", L"最小化する（Windows の通常の動き）" }, { L"中クリック（Shift＋右）", L"タスクトレイへ最小化する" },
+        { L"Alt＋左クリック", L"すべてのウィンドウを最小化する" } }; break;
+    case GP_MAX: head = L"最大化ボタン"; lines = {
+        { L"左クリック", L"最大化する（Windows の通常の動き）" }, { L"Alt＋左クリック", L"すべてのウィンドウを最大化する" } }; break;
+    case GP_CLOSE: head = L"閉じるボタン"; lines = {
+        { L"右クリック", L"いちばん後ろへ送る" }, { L"中クリック（Shift＋右）", L"常に手前に表示する／やめる" },
+        { L"Alt＋左クリック", L"すべてのウィンドウを閉じる（確認あり）" } }; break;
+    default: lines = {
+        { L"タイトルバー", L"巻き上げ・半透明・最背面" }, { L"最小化ボタン", L"トレイへ最小化" },
+        { L"閉じるボタン", L"最背面・常に手前に表示" } }; break;
+    }
+    RECT box = { S(22), bar + S(84), W - S(22), bar + S(198) };
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        FillRound(g, box, 6 * (float)s, C_PANEL, C_BORDER);
+        g.Flush();
+    }
+    RECT hr = { box.left + S(14), box.top + S(10), box.right - S(14), box.top + S(28) };
+    DrawTextIn(dc, head, hr, gd->fSB, C_SUB, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    for (size_t i = 0; i < lines.size(); i++) {
+        int y = box.top + S(32) + (int)i * S(20);
+        RECT a = { box.left + S(14), y, box.left + S(14) + S(170), y + S(20) };
+        RECT b = { box.left + S(14) + S(176), y, box.right - S(14), y + S(20) };
+        DrawTextIn(dc, lines[i].op, a, gd->fB, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextIn(dc, lines[i].act, b, gd->fN, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    // footer
+    RECT f1 = { S(22), box.bottom + S(12), W - S(22), box.bottom + S(32) };
+    DrawTextIn(dc, L"WinRoll（© 2003–2004 Wil Palma）をマジ！リスペクト！！", f1, gd->fS, C_SUB, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextIn(dc, L"×・クリック・Esc で閉じる", f1, gd->fS, C_SUB, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+    BitBlt(hdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, ob); DeleteObject(bmp); DeleteDC(dc);
+    EndPaint(hwnd, &ps);
+}
+
+static LRESULT CALLBACK GuideProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Guide* gd = (Guide*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)lp)->lpCreateParams);
+        break;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: if (gd) { PaintGuide(hwnd, gd); return 0; } break;
+    case WM_MOUSEMOVE: if (gd) {
+        int part = GuideHit(gd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (part != gd->part) { gd->part = part; InvalidateRect(hwnd, nullptr, FALSE); }
+        TRACKMOUSEEVENT t = { sizeof(t), TME_LEAVE, hwnd, 0 }; TrackMouseEvent(&t);
+        return 0; }
+        break;
+    case WM_MOUSELEAVE: if (gd && gd->part != GP_NONE) { gd->part = GP_NONE; InvalidateRect(hwnd, nullptr, FALSE); } return 0;
+    case WM_LBUTTONUP: if (gd) {
+        int part = GuideHit(gd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        if (part == GP_CLOSE || part == GP_NONE) DestroyWindow(hwnd);   // the drawn title bar and min/max only explain
+        return 0; }
+        break;
+    case WM_KEYDOWN: if (wp == VK_ESCAPE || wp == VK_RETURN) { DestroyWindow(hwnd); return 0; } break;
+    case WM_DESTROY: if (g_guideWnd == hwnd) g_guideWnd = nullptr; return 0;
+    case WM_NCDESTROY:
+        if (gd) {
+            DeleteObject(gd->fTitle); DeleteObject(gd->fN); DeleteObject(gd->fB); DeleteObject(gd->fS); DeleteObject(gd->fSB);
+            if (gd->icon) DestroyIcon(gd->icon);
+            delete gd;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowGuide() {
+    if (g_guideWnd) { SetForegroundWindow(g_guideWnd); return; }
+    POINT cur; GetCursorPos(&cur);
+    HMONITOR mon = MonitorFromPoint(cur, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
+    double s;
+    if (g_set.followDpi) { UINT dx = 96, dy = 96; GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy); s = dx / 96.0; }
+    else s = g_set.sizePct / 100.0;
+    Guide* gd = new Guide();
+    gd->scale = s; gd->part = GP_NONE;
+    gd->fTitle = MakeFont(22 * s, true); gd->fN = MakeFont(13 * s, false); gd->fB = MakeFont(13 * s, true);
+    gd->fS = MakeFont(11 * s, false); gd->fSB = MakeFont(12 * s, true);
+    int is = (int)(56 * s + 0.5);
+    gd->icon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, is, is, 0);
+    int w = (int)(GUIDE_W * s + 0.5), h = (int)(GUIDE_H * s + 0.5);
+    int x = (mi.rcWork.left + mi.rcWork.right - w) / 2, y = (mi.rcWork.top + mi.rcWork.bottom - h) / 2;
+    HWND hw = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, GUIDE_CLASS, L"シンプル WinRoll — バージョン情報",
+                              WS_POPUP, x, y, w, h, nullptr, nullptr, g_inst, gd);
+    if (!hw) { delete gd; return; }
+    DWORD pref = 2; DwmSetWindowAttribute(hw, 33, &pref, sizeof(pref));
+    COLORREF bc = C_BORDER; DwmSetWindowAttribute(hw, 34, &bc, sizeof(bc));
+    g_guideWnd = hw;
+    ShowWindow(hw, SW_SHOW);
+    SetForegroundWindow(hw);
+}
+
+// Gray copy of an icon, for the tray while paused.
+static HICON MakeGrayIcon(HICON src) {
+    ICONINFO ii; if (!src || !GetIconInfo(src, &ii)) return nullptr;
+    BITMAP bm; GetObject(ii.hbmColor, sizeof(bm), &bm);
+    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = bm.bmWidth; bi.bmiHeader.biHeight = -bm.bmHeight;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    std::vector<DWORD> px((size_t)bm.bmWidth * bm.bmHeight);
+    HDC dc = GetDC(nullptr);
+    GetDIBits(dc, ii.hbmColor, 0, bm.bmHeight, px.data(), &bi, DIB_RGB_COLORS);
+    for (auto& p : px) {
+        BYTE a = (BYTE)(p >> 24), r = (BYTE)(p >> 16), g = (BYTE)(p >> 8), b = (BYTE)p;
+        BYTE y = (BYTE)((r * 30 + g * 59 + b * 11) / 100);
+        y = (BYTE)(y + (255 - y) / 3);                    // a little lighter
+        a = (BYTE)(a * 0.7);                               // and faded
+        p = ((DWORD)a << 24) | ((DWORD)y << 16) | ((DWORD)y << 8) | y;
+    }
+    HBITMAP col = CreateDIBitmap(dc, &bi.bmiHeader, CBM_INIT, px.data(), &bi, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    ICONINFO ni = ii; ni.hbmColor = col;
+    HICON out = CreateIconIndirect(&ni);
+    DeleteObject(col); DeleteObject(ii.hbmColor); DeleteObject(ii.hbmMask);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Tray icon and main window
 // ---------------------------------------------------------------------------
 static void UpdateTrayIcon() {
@@ -1770,12 +1972,13 @@ static void UpdateTrayIcon() {
     bool want = !g_set.hideIcon || g_forceIcon || (g_set.trayAsMenu && !g_trayed.empty());
     NOTIFYICONDATAW nid = { sizeof(nid) };
     nid.hWnd = g_main; nid.uID = ID_TRAY;
-    if (want && !g_trayShown) {
+    if (want) {
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_APP_TRAY;
-        nid.hIcon = g_appIconSmall;
-        wcscpy_s(nid.szTip, L"シンプル WinRoll");
-        g_trayShown = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+        nid.hIcon = (g_enabled || !g_grayIconSmall) ? g_appIconSmall : g_grayIconSmall;
+        wcscpy_s(nid.szTip, g_enabled ? L"シンプル WinRoll" : L"シンプル WinRoll（停止中）");
+        if (g_trayShown) Shell_NotifyIconW(NIM_MODIFY, &nid);
+        else g_trayShown = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
     } else if (!want && g_trayShown) {
         Shell_NotifyIconW(NIM_DELETE, &nid);
         g_trayShown = false;
@@ -1784,14 +1987,18 @@ static void UpdateTrayIcon() {
 
 static void ShowTrayMenu() {
     HMENU m = CreatePopupMenu();
-    if (g_set.trayAsMenu && !g_trayed.empty()) {
-        for (size_t i = 0; i < g_trayed.size() && i < 200; i++)
-            AppendMenuW(m, MF_STRING, IDM_TRAYED_BASE + i, TrayLabel(g_trayed[i]).c_str());
-        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    }
-    AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"設定…");
-    AppendMenuW(m, MF_STRING, IDM_ABOUT, L"操作一覧…\tF1");
+    // 最小化したウィンドウ › (windows minimized to the tray)
+    HMENU sub = CreatePopupMenu();
+    for (size_t i = 0; i < g_trayed.size() && i < 200; i++)
+        AppendMenuW(sub, MF_STRING, IDM_TRAYED_BASE + i, TrayLabel(g_trayed[i]).c_str());
+    if (g_trayed.empty()) AppendMenuW(sub, MF_STRING | MF_GRAYED, 0, L"（なし）");
+    AppendMenuW(m, MF_POPUP | (g_trayed.empty() ? MF_GRAYED : 0), (UINT_PTR)sub, L"最小化したウィンドウ");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), IDM_ENABLE, L"有効");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"設定…");
+    AppendMenuW(m, MF_STRING, IDM_ABOUT, L"操作一覧…");
+    AppendMenuW(m, MF_STRING, IDM_VERSION, L"バージョン情報…");
     AppendMenuW(m, MF_STRING | ((g_rolled.empty() && g_trayed.empty()) ? MF_GRAYED : 0), IDM_RESTOREALL, L"すべて元に戻す");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"終了");
@@ -1806,6 +2013,7 @@ static void ShowTrayMenu() {
 static void QuitApp() {
     if (g_settingsWnd) DestroyWindow(g_settingsWnd);
     if (g_aboutWnd) DestroyWindow(g_aboutWnd);
+    if (g_guideWnd) DestroyWindow(g_guideWnd);
     UnrollAll();
     RestoreAllTrayed();
     RestoreAllTranslucent();
@@ -1859,6 +2067,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case IDM_SETTINGS: ShowSettings(); break;
         case IDM_ABOUT: ShowAbout(); break;
+        case IDM_VERSION: ShowGuide(); break;
+        case IDM_ENABLE: g_enabled = !g_enabled; UpdateTrayIcon(); break;
         case IDM_RESTOREALL: UnrollAll(); RestoreAllTrayed(); break;
         case IDM_EXIT: QuitApp(); break;
         default:
@@ -1988,6 +2198,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     g_appIconSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     g_appIconBig   = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
+    g_grayIconSmall = MakeGrayIcon(g_appIconSmall);
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.hInstance = hInst; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
@@ -2008,6 +2219,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     sc.hInstance = hInst; sc.hCursor = LoadCursor(nullptr, IDC_HAND);
     sc.lpfnWndProc = SplashProc; sc.lpszClassName = SPLASH_CLASS; sc.style = CS_DROPSHADOW;
     RegisterClassExW(&sc);
+
+    WNDCLASSEXW gc = { sizeof(gc) };
+    gc.hInstance = hInst; gc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    gc.lpfnWndProc = GuideProc; gc.lpszClassName = GUIDE_CLASS; gc.style = CS_DROPSHADOW;
+    RegisterClassExW(&gc);
 
     WNDCLASSEXW nc = { sizeof(nc) };
     nc.hInstance = hInst; nc.hCursor = LoadCursor(nullptr, IDC_HAND);
