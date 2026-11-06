@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.3.1
+// シンプル WinRoll ver 1.3.2
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -25,6 +25,7 @@
 #include <vector>
 #include <cstdio>
 #include <cwchar>
+#include <atomic>
 #ifndef ICON_SMALL2
 #define ICON_SMALL2 2
 #endif
@@ -33,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.3.1";
+static const wchar_t* APP_VERSION   = L"1.3.2";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -105,7 +106,10 @@ struct Rolled {
 
 static HINSTANCE g_inst;
 static HWND g_main;
-static HHOOK g_mouseHook;
+static HHOOK g_mouseHook;              // owned by the hook thread
+static DWORD g_hookThreadId;
+static HANDLE g_hookThread;
+static std::atomic<bool> g_noMiddleFlag{false};   // copy of g_set.noMiddle for the hook thread
 static Settings g_set;
 static std::vector<Rolled*> g_rolled;
 static bool g_trayShown = false;
@@ -168,6 +172,7 @@ static void LoadSettings() {
     g_set.autoStart = GetPrivateProfileIntW(L"startup", L"autoStart", 0, ini.c_str()) != 0;
     g_set.hideIcon  = GetPrivateProfileIntW(L"startup", L"hideIcon", 0, ini.c_str()) != 0;
     g_set.noMiddle  = GetPrivateProfileIntW(L"mouse", L"noMiddle", 0, ini.c_str()) != 0;
+    g_noMiddleFlag = g_set.noMiddle;
     g_set.trayAsMenu = GetPrivateProfileIntW(L"tray", L"asMenu", 0, ini.c_str()) != 0;
     g_set.showSplash = GetPrivateProfileIntW(L"startup", L"splash", 1, ini.c_str()) != 0;
 }
@@ -336,7 +341,10 @@ static std::wstring ExeDescription(DWORD pid, std::wstring* exeBaseOut) {
                 keys.push_back(L"\\StringFileInfo\\040904e4\\FileDescription");
                 for (auto& k : keys) {
                     wchar_t* v = nullptr; UINT vl = 0;
-                    if (VerQueryValueW(buf.data(), k.c_str(), (void**)&v, &vl) && v && vl > 1 && v[0]) { result = v; break; }
+                    if (VerQueryValueW(buf.data(), k.c_str(), (void**)&v, &vl) && v && vl > 1 && v[0]) {
+                        result.assign(v, wcsnlen(v, vl));   // never read past the returned length
+                        break;
+                    }
                 }
             }
         }
@@ -417,11 +425,20 @@ static void DrawTextIn(HDC dc, const std::wstring& s, RECT rc, HFONT f, COLORREF
 // Rolled-window state file (for recovery after a crash)
 // ---------------------------------------------------------------------------
 // Lines: "R <hwnd> <pid>" rolled, "T <hwnd> <pid>" in tray, "A <hwnd> <pid> <addedLayered>" translucent
+// Identifies this Windows session (the boot time, in minutes). Records from an earlier boot are ignored.
+static unsigned long long BootStamp() {
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER now; now.LowPart = ft.dwLowDateTime; now.HighPart = ft.dwHighDateTime;
+    unsigned long long bootMs = now.QuadPart / 10000ULL - GetTickCount64();
+    return bootMs / 60000ULL;
+}
+
 static void SaveRolledState() {
     std::wstring path = DataPath(L"rolled.txt");
     if (g_rolled.empty() && g_trayed.empty() && g_trans.empty()) { DeleteFileW(path.c_str()); return; }
     FILE* f = _wfopen(path.c_str(), L"w");
     if (!f) return;
+    fprintf(f, "B %llu 0 0\n", BootStamp());
     for (auto* r : g_rolled)
         fprintf(f, "R %llu %lu 0\n", (unsigned long long)(ULONG_PTR)r->target, (unsigned long)r->pid);
     for (auto* t : g_trayed)
@@ -436,7 +453,15 @@ static void RecoverFromPreviousRun() {
     FILE* f = _wfopen(path.c_str(), L"r");
     if (!f) return;
     char line[128];
+    unsigned long long boot = BootStamp();
+    bool skip = false;
     while (fgets(line, sizeof(line), f)) {
+        if (line[0] == 'B') {   // written in an earlier Windows session? then every handle in it is stale
+            unsigned long long b = 0;
+            if (sscanf(line, "B %llu", &b) == 1 && (b + 1 < boot || b > boot + 1)) skip = true;
+            continue;
+        }
+        if (skip) break;
         char type = 'R'; unsigned long long hv = 0; unsigned long pid = 0; int added = 0;
         if (line[0] >= 'A' && line[0] <= 'Z') {
             if (sscanf(line, "%c %llu %lu %d", &type, &hv, &pid, &added) < 3) continue;
@@ -446,7 +471,10 @@ static void RecoverFromPreviousRun() {
         DWORD realPid = 0; GetWindowThreadProcessId(h, &realPid);
         if (realPid != pid) continue;  // handle was reused by another program
         if (type == 'A') {
-            SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+            // Only undo it if the window still has exactly the alpha we set.
+            BYTE alpha = 255; DWORD fl = 0; COLORREF key = 0;
+            if (!GetLayeredWindowAttributes(h, &key, &alpha, &fl) || !(fl & LWA_ALPHA) || alpha != TRANSLUCENT_ALPHA) continue;
+            SetLayeredWindowAttributes(h, key, 255, fl);
             if (added) SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) & ~WS_EX_LAYERED);
         } else if (!IsWindowVisible(h)) {
             ShowWindowAsync(h, SW_SHOWNA);
@@ -899,12 +927,17 @@ static void DoAction(int act, HWND h) {
             if (GetWindowLongPtrW(w, GWL_STYLE) & WS_MAXIMIZEBOX) ShowWindowAsync(w, SW_MAXIMIZE);
         break;
     case A_CLOSE_ALL: {
+        static bool s_asking = false;      // don't open a second confirmation while one is shown
+        if (s_asking) break;
         std::vector<HWND> ws = AppWindows();
         if (ws.empty()) break;
         wchar_t msg[256];
         swprintf(msg, 256, L"表示中のウィンドウ %d 個をすべて閉じますか？\n（保存していない内容があるアプリは、それぞれ確認が出ます）", (int)ws.size());
         SetForegroundWindow(g_main);
-        if (MessageBoxW(g_main, msg, APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST) == IDYES)
+        s_asking = true;
+        int ans = MessageBoxW(g_main, msg, APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST);
+        s_asking = false;
+        if (ans == IDYES)
             for (HWND w : ws) if (IsWindow(w)) PostMessageW(w, WM_SYSCOMMAND, SC_CLOSE, 0);
         break;
     }
@@ -1082,7 +1115,7 @@ static LRESULT HitTestAt(HWND h, POINT pt) {
     if (g_physToLog) g_physToLog(h, &p);
     DWORD_PTR ht = 0;
     if (!SendMessageTimeoutW(h, WM_NCHITTEST, 0, MAKELPARAM((short)p.x, (short)p.y),
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &ht)) return HTNOWHERE;
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, &ht)) return HTNOWHERE;
     return (LRESULT)ht;
 }
 
@@ -1126,15 +1159,17 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
             bool test = false;
             if (!ctrl) {
                 if (wp == WM_RBUTTONDOWN) test = true;
-                else if (wp == WM_MBUTTONDOWN) test = !g_set.noMiddle;
+                else if (wp == WM_MBUTTONDOWN) test = !g_noMiddleFlag;
                 else test = shift || alt;          // plain left clicks are never touched
             }
             if (test) {
                 HWND under = WindowFromPoint(m->pt);
                 HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
-                if (root && IsRollable(root)) {
+                if (root && !IsHungAppWindow(root) && IsRollable(root)) {   // never wait on a hung app
+                    DWORD t0 = GetTickCount();
                     LRESULT ht = HitTestAt(root, m->pt);
-                    if (!IsInteresting(ht) && under != root) ht = HitTestAt(under, m->pt);
+                    // Ask the child window only if the first answer came back quickly.
+                    if (!IsInteresting(ht) && under != root && GetTickCount() - t0 < 30) ht = HitTestAt(under, m->pt);
                     int act = DecideAction(wp, ht, shift, alt);
                     if (act) {
                         swallowUp = (wp == WM_RBUTTONDOWN) ? WM_RBUTTONUP : (wp == WM_MBUTTONDOWN) ? WM_MBUTTONUP : WM_LBUTTONUP;
@@ -1466,6 +1501,7 @@ static void ApplySettings(const Settings& s) {
     bool scaleChanged = (s.sizePct != g_set.sizePct || s.followDpi != g_set.followDpi);
     bool trayModeChanged = (s.trayAsMenu != g_set.trayAsMenu);
     g_set = s;
+    g_noMiddleFlag = s.noMiddle;
     g_forceIcon = false;        // honour "hide tray icon" right away
     SaveSettings();
     ApplyAutoStart();
@@ -1849,8 +1885,69 @@ static BOOL WINAPI ConsoleHandler(DWORD) { RestoreAllHidden(); return FALSE; }
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+// The mouse hook lives on its own thread, so a busy main thread never delays mouse input.
+// Windows silently drops a low-level hook that is too slow, so it is re-installed every 30 s.
+static DWORD WINAPI HookThreadProc(LPVOID ready) {
+    MSG m;
+    PeekMessageW(&m, nullptr, WM_USER, WM_USER, PM_NOREMOVE);   // create this thread's message queue
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, g_inst, 0);
+    SetEvent((HANDLE)ready);
+    UINT_PTR t = SetTimer(nullptr, 0, 30000, nullptr);
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        if (m.message == WM_TIMER && m.hwnd == nullptr) {
+            HHOOK nh = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, g_inst, 0);
+            if (nh) { if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nh; }
+        }
+    }
+    KillTimer(nullptr, t);
+    if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
+    g_mouseHook = nullptr;
+    return 0;
+}
+
+// Guard: a second copy started with "--guard <pid>". If the main copy is killed
+// (e.g. from Task Manager), it brings every hidden window back.
+static bool RunGuardIfAsked() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return false;
+    bool guard = false; DWORD pid = 0;
+    for (int i = 1; i + 1 < argc; i++)
+        if (wcscmp(argv[i], L"--guard") == 0) { guard = true; pid = (DWORD)wcstoul(argv[i + 1], nullptr, 10); }
+    LocalFree(argv);
+    if (!guard) return false;
+    HANDLE ph = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
+    if (ph) {
+        WaitForSingleObject(ph, INFINITE);
+        CloseHandle(ph);
+        Sleep(300);
+        InitDataDir();
+        RecoverFromPreviousRun();   // after a normal exit the record is already gone, so this does nothing
+    }
+    return true;
+}
+
+static void StartGuard() {
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    wchar_t cmd[MAX_PATH + 64];
+    swprintf(cmd, MAX_PATH + 64, L"\"%ls\" --guard %lu", exe, (unsigned long)GetCurrentProcessId());
+    STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi{};
+    if (CreateProcessW(exe, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+                       nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+}
+
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_inst = hInst;
+
+    // [DLL safety] Load DLLs only from System32 (never from the exe's folder or the current folder).
+    // dwmapi / gdiplus / version / shcore are delay-loaded, so they are first loaded after this line.
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    SetDllDirectoryW(L"");
+
+    if (RunGuardIfAsked()) return 0;
 
     HANDLE mutex = CreateMutexW(nullptr, TRUE, MUTEX_NAME);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -1875,6 +1972,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     InitDataDir();
     LoadSettings();
     RecoverFromPreviousRun();
+    StartGuard();
     if (g_set.autoStart) ApplyAutoStart();  // keep the path current if the exe was moved
 
     g_appIconSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
@@ -1912,7 +2010,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     UpdateTrayIcon();
     SetTimer(g_main, MAIN_TIMER, 1000, nullptr);
 
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, hInst, 0);
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_hookThread = CreateThread(nullptr, 0, HookThreadProc, ready, 0, &g_hookThreadId);
+    if (g_hookThread) WaitForSingleObject(ready, 5000);
+    CloseHandle(ready);
     if (!g_mouseHook) {
         MessageBoxW(nullptr, L"マウスの監視を開始できませんでした。", APP_NAME, MB_ICONERROR);
     }
@@ -1924,7 +2025,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&m);
     }
 
-    if (g_mouseHook) UnhookWindowsHookEx(g_mouseHook);
+    if (g_hookThread) {
+        PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+        WaitForSingleObject(g_hookThread, 2000);
+        CloseHandle(g_hookThread);
+    }
     RestoreAllHidden();
     for (auto* r : std::vector<Rolled*>(g_rolled)) RemoveRolled(r);
     Gdiplus::GdiplusShutdown(g_gdipToken);

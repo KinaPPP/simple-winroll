@@ -1,0 +1,3 @@
+LIBRARY shcore.dll
+EXPORTS
+    GetDpiForMonitor
