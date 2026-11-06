@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.1.1
+// シンプル WinRoll ver 1.2.0
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -32,7 +32,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.1.1";
+static const wchar_t* APP_VERSION   = L"1.2.0";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -45,11 +45,18 @@ enum {
     WM_APP_ROLL       = WM_APP + 1,   // wParam = HWND to roll
     WM_APP_TRAY       = WM_APP + 2,
     WM_APP_REACTIVATE = WM_APP + 3,   // a second copy was launched
+    WM_APP_ACTION     = WM_APP + 4,   // wParam = Action, lParam = HWND
+    WM_APP_TRAYWIN    = WM_APP + 5,   // a window minimized to the tray (wParam = icon id)
 };
 enum {
     ID_TRAY = 1,
     IDM_SETTINGS = 100, IDM_ABOUT, IDM_RESTOREALL, IDM_EXIT,
+    IDM_TW_RESTORE = 300, IDM_TW_CLOSE,
+    IDM_TRAYED_BASE = 1000,          // + index (tray "menu" mode)
 };
+enum Action { A_ROLL = 1, A_ROLL_ALL, A_TRANSLUCENT, A_BACK, A_TOPMOST, A_TRAY, A_MIN_ALL, A_MAX_ALL, A_CLOSE_ALL };
+static const UINT_PTR MAIN_TIMER = 2;
+static const BYTE TRANSLUCENT_ALPHA = 204;   // 80%
 static const UINT_PTR BAR_TIMER = 1;
 
 // Palette (KINA default)
@@ -73,6 +80,8 @@ struct Settings {
     bool followDpi = false;
     bool autoStart = false;
     bool hideIcon  = false;
+    bool noMiddle  = false;   // don't use the middle mouse button (Shift+Right still works)
+    bool trayAsMenu = false;  // tray-minimized windows: false = own icon, true = listed in our menu
 };
 
 struct Rolled {
@@ -103,6 +112,28 @@ static HWND g_settingsWnd, g_aboutWnd;
 static ULONG_PTR g_gdipToken;
 static HICON g_appIconSmall, g_appIconBig;
 
+struct Trayed {                 // a window minimized to the tray
+    HWND target = nullptr;
+    DWORD pid = 0;
+    UINT id = 0;
+    bool hasIcon = false;
+    HICON icon = nullptr;
+    std::wstring title;
+};
+static std::vector<Trayed*> g_trayed;
+static UINT g_nextTrayId = 1000;
+
+struct Translucent {            // a window we made translucent
+    HWND h = nullptr;
+    DWORD pid = 0;
+    bool addedLayered = false;
+    COLORREF key = 0;
+    DWORD flags = 0;
+};
+static std::vector<Translucent> g_trans;
+
+static void UpdateTrayIcon();
+
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
@@ -132,6 +163,8 @@ static void LoadSettings() {
     g_set.followDpi = GetPrivateProfileIntW(L"display", L"followDpi", 0, ini.c_str()) != 0;
     g_set.autoStart = GetPrivateProfileIntW(L"startup", L"autoStart", 0, ini.c_str()) != 0;
     g_set.hideIcon  = GetPrivateProfileIntW(L"startup", L"hideIcon", 0, ini.c_str()) != 0;
+    g_set.noMiddle  = GetPrivateProfileIntW(L"mouse", L"noMiddle", 0, ini.c_str()) != 0;
+    g_set.trayAsMenu = GetPrivateProfileIntW(L"tray", L"asMenu", 0, ini.c_str()) != 0;
 }
 
 static void SaveSettings() {
@@ -142,6 +175,8 @@ static void SaveSettings() {
     WritePrivateProfileStringW(L"display", L"followDpi", g_set.followDpi ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"startup", L"autoStart", g_set.autoStart ? L"1" : L"0", ini.c_str());
     WritePrivateProfileStringW(L"startup", L"hideIcon", g_set.hideIcon ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"mouse", L"noMiddle", g_set.noMiddle ? L"1" : L"0", ini.c_str());
+    WritePrivateProfileStringW(L"tray", L"asMenu", g_set.trayAsMenu ? L"1" : L"0", ini.c_str());
 }
 
 static void ApplyAutoStart() {
@@ -375,13 +410,18 @@ static void DrawTextIn(HDC dc, const std::wstring& s, RECT rc, HFONT f, COLORREF
 // ---------------------------------------------------------------------------
 // Rolled-window state file (for recovery after a crash)
 // ---------------------------------------------------------------------------
+// Lines: "R <hwnd> <pid>" rolled, "T <hwnd> <pid>" in tray, "A <hwnd> <pid> <addedLayered>" translucent
 static void SaveRolledState() {
     std::wstring path = DataPath(L"rolled.txt");
-    if (g_rolled.empty()) { DeleteFileW(path.c_str()); return; }
+    if (g_rolled.empty() && g_trayed.empty() && g_trans.empty()) { DeleteFileW(path.c_str()); return; }
     FILE* f = _wfopen(path.c_str(), L"w");
     if (!f) return;
     for (auto* r : g_rolled)
-        fprintf(f, "%llu %lu\n", (unsigned long long)(ULONG_PTR)r->target, (unsigned long)r->pid);
+        fprintf(f, "R %llu %lu 0\n", (unsigned long long)(ULONG_PTR)r->target, (unsigned long)r->pid);
+    for (auto* t : g_trayed)
+        fprintf(f, "T %llu %lu 0\n", (unsigned long long)(ULONG_PTR)t->target, (unsigned long)t->pid);
+    for (auto& a : g_trans)
+        fprintf(f, "A %llu %lu %d\n", (unsigned long long)(ULONG_PTR)a.h, (unsigned long)a.pid, a.addedLayered ? 1 : 0);
     fclose(f);
 }
 
@@ -389,13 +429,22 @@ static void RecoverFromPreviousRun() {
     std::wstring path = DataPath(L"rolled.txt");
     FILE* f = _wfopen(path.c_str(), L"r");
     if (!f) return;
-    unsigned long long hv; unsigned long pid;
-    while (fscanf(f, "%llu %lu", &hv, &pid) == 2) {
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        char type = 'R'; unsigned long long hv = 0; unsigned long pid = 0; int added = 0;
+        if (line[0] >= 'A' && line[0] <= 'Z') {
+            if (sscanf(line, "%c %llu %lu %d", &type, &hv, &pid, &added) < 3) continue;
+        } else if (sscanf(line, "%llu %lu", &hv, &pid) != 2) continue;   // ver 1.0-1.1 format
         HWND h = (HWND)(ULONG_PTR)hv;
-        if (!IsWindow(h) || IsWindowVisible(h)) continue;
+        if (!IsWindow(h)) continue;
         DWORD realPid = 0; GetWindowThreadProcessId(h, &realPid);
         if (realPid != pid) continue;  // handle was reused by another program
-        ShowWindowAsync(h, SW_SHOWNA);
+        if (type == 'A') {
+            SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
+            if (added) SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+        } else if (!IsWindowVisible(h)) {
+            ShowWindowAsync(h, SW_SHOWNA);
+        }
     }
     fclose(f);
     DeleteFileW(path.c_str());
@@ -406,6 +455,14 @@ static void RestoreAllHidden() {
     for (auto* r : g_rolled)
         if (r->target && IsWindow(r->target) && !IsWindowVisible(r->target))
             ShowWindowAsync(r->target, SW_SHOWNA);
+    for (auto* t : g_trayed)
+        if (t->target && IsWindow(t->target) && !IsWindowVisible(t->target))
+            ShowWindowAsync(t->target, SW_SHOWNA);
+    for (auto& a : g_trans)
+        if (IsWindow(a.h)) {
+            SetLayeredWindowAttributes(a.h, a.key, 255, a.flags | LWA_ALPHA);
+            if (a.addedLayered) SetWindowLongPtrW(a.h, GWL_EXSTYLE, GetWindowLongPtrW(a.h, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +526,8 @@ static bool IsRollable(HWND h) {
     return true;
 }
 
+static void ApplyBarAlpha(Rolled* r);
+
 static void RollWindow(HWND h) {
     if (!IsRollable(h) || FindByTarget(h)) return;
 
@@ -502,6 +561,7 @@ static void RollWindow(HWND h) {
                              vis.left, vis.top, w, bh, nullptr, nullptr, g_inst, r);
     if (!r->bar) { if (r->iconSmall) DestroyIcon(r->iconSmall); if (r->iconBig) DestroyIcon(r->iconBig); delete r; return; }
     g_rolled.push_back(r);
+    ApplyBarAlpha(r);
     if (!r->aumid.empty()) SetWindowAumid(r->bar, r->aumid.c_str());  // group with the app on the taskbar
 
     SendMessageW(r->bar, WM_SETICON, ICON_SMALL, (LPARAM)r->iconSmall);
@@ -540,6 +600,225 @@ static void UnrollWindow(Rolled* r, bool activate) {
 
 static void UnrollAll() {
     while (!g_rolled.empty()) UnrollWindow(g_rolled.back(), false);
+}
+
+// ---------------------------------------------------------------------------
+// Other modes: translucency, back / top, tray, all windows
+// ---------------------------------------------------------------------------
+static bool TransparencyEnabled() {   // Settings > Personalization > Colors > Transparency effects
+    DWORD v = 1, sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"EnableTransparency", RRF_RT_REG_DWORD, nullptr, &v, &sz) != ERROR_SUCCESS) return true;
+    return v != 0;
+}
+
+static int FindTrans(HWND h) { for (size_t i = 0; i < g_trans.size(); i++) if (g_trans[i].h == h) return (int)i; return -1; }
+
+static void ApplyBarAlpha(Rolled* r) {
+    if (!r || !r->bar) return;
+    bool t = FindTrans(r->target) >= 0;
+    LONG_PTR ex = GetWindowLongPtrW(r->bar, GWL_EXSTYLE);
+    if (t) {
+        if (!(ex & WS_EX_LAYERED)) SetWindowLongPtrW(r->bar, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(r->bar, 0, TRANSLUCENT_ALPHA, LWA_ALPHA);
+    } else if (ex & WS_EX_LAYERED) {
+        SetWindowLongPtrW(r->bar, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+        RedrawWindow(r->bar, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
+    }
+}
+
+static void RemoveTranslucent(int i) {
+    Translucent a = g_trans[i];
+    g_trans.erase(g_trans.begin() + i);
+    if (IsWindow(a.h)) {
+        SetLayeredWindowAttributes(a.h, a.key, 255, a.flags | LWA_ALPHA);
+        if (a.addedLayered) SetWindowLongPtrW(a.h, GWL_EXSTYLE, GetWindowLongPtrW(a.h, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+    }
+    ApplyBarAlpha(FindByTarget(a.h));
+}
+
+static void RestoreAllTranslucent() {
+    while (!g_trans.empty()) RemoveTranslucent((int)g_trans.size() - 1);
+    SaveRolledState();
+}
+
+static void ToggleTranslucent(HWND h) {
+    int i = FindTrans(h);
+    if (i >= 0) { RemoveTranslucent(i); SaveRolledState(); return; }
+    if (!TransparencyEnabled()) { MessageBeep(MB_OK); return; }   // follow Windows' own setting
+    Translucent a; a.h = h; GetWindowThreadProcessId(h, &a.pid);
+    LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    if (ex & WS_EX_LAYERED) {
+        BYTE alpha = 255; DWORD fl = 0; COLORREF key = 0;
+        // Windows drawn with UpdateLayeredWindow cannot be changed this way.
+        if (!GetLayeredWindowAttributes(h, &key, &alpha, &fl)) { MessageBeep(MB_OK); return; }
+        if ((fl & LWA_ALPHA) && alpha < 255) { MessageBeep(MB_OK); return; }   // already translucent by the app itself
+        a.key = key; a.flags = fl & LWA_COLORKEY;
+    } else {
+        SetWindowLongPtrW(h, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+        a.addedLayered = true;
+    }
+    if (!SetLayeredWindowAttributes(h, a.key, TRANSLUCENT_ALPHA, a.flags | LWA_ALPHA)) {
+        if (a.addedLayered) SetWindowLongPtrW(h, GWL_EXSTYLE, ex);
+        MessageBeep(MB_OK);
+        return;
+    }
+    g_trans.push_back(a);
+    ApplyBarAlpha(FindByTarget(h));
+    SaveRolledState();
+}
+
+static void SendToBack(HWND h) {
+    SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+}
+
+static void ToggleTopmost(HWND h) {
+    bool top = (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+    SetWindowPos(h, top ? HWND_NOTOPMOST : HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+}
+
+// --- tray ---
+static Trayed* FindTrayedById(UINT id) { for (auto* t : g_trayed) if (t->id == id) return t; return nullptr; }
+
+static std::wstring TrayLabel(const Trayed* t) {
+    std::wstring s = t->title.empty() ? L"(タイトルなし)" : t->title;
+    if (s.size() > 60) s = s.substr(0, 58) + L"…";
+    return s;
+}
+
+static void AddTrayedIcon(Trayed* t) {
+    NOTIFYICONDATAW nid = { sizeof(nid) };
+    nid.hWnd = g_main; nid.uID = t->id;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_APP_TRAYWIN;
+    nid.hIcon = t->icon;
+    std::wstring tip = TrayLabel(t);
+    wcsncpy(nid.szTip, tip.c_str(), 127); nid.szTip[127] = 0;
+    t->hasIcon = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
+}
+
+static void RemoveTrayedIcon(Trayed* t) {
+    if (!t->hasIcon) return;
+    NOTIFYICONDATAW nid = { sizeof(nid) }; nid.hWnd = g_main; nid.uID = t->id;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    t->hasIcon = false;
+}
+
+static void RemoveTrayed(Trayed* t) {
+    RemoveTrayedIcon(t);
+    for (size_t i = 0; i < g_trayed.size(); i++) if (g_trayed[i] == t) { g_trayed.erase(g_trayed.begin() + i); break; }
+    if (t->icon) DestroyIcon(t->icon);
+    delete t;
+    SaveRolledState();
+    UpdateTrayIcon();
+}
+
+static void TrayWindow(HWND h) {
+    if (!IsRollable(h)) return;
+    for (auto* t : g_trayed) if (t->target == h) return;
+    Trayed* t = new Trayed();
+    t->target = h;
+    GetWindowThreadProcessId(h, &t->pid);
+    t->title = ReadTitle(h);
+    t->icon = GetWindowIconCopy(h, t->pid, false);
+    t->id = g_nextTrayId++;
+    g_trayed.push_back(t);
+    SaveRolledState();               // record BEFORE hiding
+    ShowWindowAsync(h, SW_HIDE);
+    if (g_set.trayAsMenu) UpdateTrayIcon();   // make sure our own icon is there to hold the menu
+    else AddTrayedIcon(t);
+}
+
+static void RestoreTrayed(Trayed* t, bool activate) {
+    HWND h = t->target;
+    if (IsWindow(h)) {
+        ShowWindowAsync(h, SW_SHOW);
+        if (activate) SetForegroundWindow(h);
+    }
+    RemoveTrayed(t);
+}
+
+static void RestoreAllTrayed() { while (!g_trayed.empty()) RestoreTrayed(g_trayed.back(), false); }
+
+static void ApplyTrayMode() {   // after the "as icon / as menu" setting changes
+    for (auto* t : g_trayed) {
+        if (g_set.trayAsMenu) RemoveTrayedIcon(t);
+        else if (!t->hasIcon) AddTrayedIcon(t);
+    }
+    UpdateTrayIcon();
+}
+
+static void ShowTrayedMenu(Trayed* t) {
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, TrayLabel(t).c_str());
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_TW_RESTORE, L"元に戻す");
+    AppendMenuW(m, MF_STRING, IDM_TW_CLOSE, L"閉じる");
+    SetMenuDefaultItem(m, IDM_TW_RESTORE, FALSE);
+    POINT pt; GetCursorPos(&pt);
+    SetForegroundWindow(g_main);
+    UINT cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, g_main, nullptr);
+    PostMessageW(g_main, WM_NULL, 0, 0);
+    DestroyMenu(m);
+    UINT id = t->id;
+    Trayed* still = FindTrayedById(id);
+    if (!still) return;
+    if (cmd == IDM_TW_RESTORE) RestoreTrayed(still, true);
+    else if (cmd == IDM_TW_CLOSE) {
+        HWND h = still->target;
+        RestoreTrayed(still, true);
+        if (IsWindow(h)) PostMessageW(h, WM_SYSCOMMAND, SC_CLOSE, 0);
+    }
+}
+
+// --- all windows ---
+static bool IsAppWindow(HWND h) {
+    if (!IsRollable(h)) return false;
+    LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    if (ex & WS_EX_TOOLWINDOW) return false;
+    if (GetWindow(h, GW_OWNER) && !(ex & WS_EX_APPWINDOW)) return false;
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return false;
+    if (GetWindowTextLengthW(h) == 0) return false;
+    return true;
+}
+
+static BOOL CALLBACK CollectProc(HWND h, LPARAM lp) {
+    if (IsAppWindow(h)) ((std::vector<HWND>*)lp)->push_back(h);
+    return TRUE;
+}
+
+static std::vector<HWND> AppWindows() {
+    std::vector<HWND> v; EnumWindows(CollectProc, (LPARAM)&v); return v;
+}
+
+static void DoAction(int act, HWND h) {
+    switch (act) {
+    case A_ROLL: RollWindow(h); break;
+    case A_ROLL_ALL: for (HWND w : AppWindows()) RollWindow(w); break;
+    case A_TRANSLUCENT: if (IsWindow(h)) ToggleTranslucent(h); break;
+    case A_BACK: if (IsWindow(h)) SendToBack(h); break;
+    case A_TOPMOST: if (IsWindow(h)) ToggleTopmost(h); break;
+    case A_TRAY: TrayWindow(h); break;
+    case A_MIN_ALL:
+        for (HWND w : AppWindows())
+            if (GetWindowLongPtrW(w, GWL_STYLE) & WS_MINIMIZEBOX) ShowWindowAsync(w, SW_MINIMIZE);
+        break;
+    case A_MAX_ALL:
+        for (HWND w : AppWindows())
+            if (GetWindowLongPtrW(w, GWL_STYLE) & WS_MAXIMIZEBOX) ShowWindowAsync(w, SW_MAXIMIZE);
+        break;
+    case A_CLOSE_ALL: {
+        std::vector<HWND> ws = AppWindows();
+        if (ws.empty()) break;
+        wchar_t msg[256];
+        swprintf(msg, 256, L"表示中のウィンドウ %d 個をすべて閉じますか？\n（保存していない内容があるアプリは、それぞれ確認が出ます）", (int)ws.size());
+        SetForegroundWindow(g_main);
+        if (MessageBoxW(g_main, msg, APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST) == IDYES)
+            for (HWND w : ws) if (IsWindow(w)) PostMessageW(w, WM_SYSCOMMAND, SC_CLOSE, 0);
+        break;
+    }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +916,16 @@ static LRESULT CALLBACK BarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_NCHITTEST: return HTCAPTION;   // the whole bar can be dragged
     case WM_NCRBUTTONDOWN: return 0;
-    case WM_NCRBUTTONUP: if (r) UnrollWindow(r, true); return 0;
+    case WM_NCRBUTTONUP:
+        if (r) {
+            bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0, alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            if (alt) UnrollAll();                         // Alt: unroll every bar
+            else if (shift) ToggleTranslucent(r->target); // Shift+Right = middle click
+            else UnrollWindow(r, true);
+        }
+        return 0;
+    case WM_NCMBUTTONDOWN: return 0;
+    case WM_NCMBUTTONUP: if (r && !g_set.noMiddle) ToggleTranslucent(r->target); return 0;
     case WM_CONTEXTMENU: return 0;
     case WM_NCLBUTTONDBLCLK: if (r) UnrollWindow(r, true); return 0;
     case WM_SYSCOMMAND:
@@ -699,39 +987,72 @@ static void RelayoutBars() {
 typedef BOOL (WINAPI *PhysToLogFn)(HWND, LPPOINT);
 static PhysToLogFn g_physToLog;
 
-static bool IsCaptionAt(HWND h, POINT pt) {
+static LRESULT HitTestAt(HWND h, POINT pt) {
     POINT p = pt;
     if (g_physToLog) g_physToLog(h, &p);
     DWORD_PTR ht = 0;
     if (!SendMessageTimeoutW(h, WM_NCHITTEST, 0, MAKELPARAM((short)p.x, (short)p.y),
-                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &ht)) return false;
-    return (LRESULT)ht == HTCAPTION;
+                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &ht)) return HTNOWHERE;
+    return (LRESULT)ht;
+}
+
+static bool IsInteresting(LRESULT ht) {
+    return ht == HTCAPTION || ht == HTCLOSE || ht == HTMINBUTTON || ht == HTMAXBUTTON;
+}
+
+// Decide what a click means. Shift+Right counts as a middle click (as in the original WinRoll).
+static int DecideAction(WPARAM btn, LRESULT ht, bool shift, bool alt) {
+    bool middle = (btn == WM_MBUTTONDOWN) || (btn == WM_RBUTTONDOWN && shift);
+    if (middle) {
+        if (ht == HTCAPTION) return A_TRANSLUCENT;
+        if (ht == HTCLOSE) return A_TOPMOST;
+        if (ht == HTMINBUTTON) return A_TRAY;
+        return 0;
+    }
+    if (btn == WM_RBUTTONDOWN) {
+        if (ht == HTCAPTION) return alt ? A_ROLL_ALL : A_ROLL;
+        if (ht == HTCLOSE && !alt) return A_BACK;
+        return 0;
+    }
+    // left button: only with Shift or Alt
+    if (shift && !alt && ht == HTCAPTION) return A_BACK;
+    if (alt && !shift) {
+        if (ht == HTMINBUTTON) return A_MIN_ALL;
+        if (ht == HTMAXBUTTON) return A_MAX_ALL;
+        if (ht == HTCLOSE) return A_CLOSE_ALL;
+    }
+    return 0;
 }
 
 static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
-    static bool swallowUp = false;
+    static WPARAM swallowUp = 0;   // the button-up message that belongs to a click we handled
     if (code == HC_ACTION) {
         auto* m = (MSLLHOOKSTRUCT*)lp;
-        if (wp == WM_RBUTTONDOWN && !(m->flags & LLMHF_INJECTED)) {
+        if (swallowUp && wp == swallowUp) { swallowUp = 0; return 1; }
+        if (!(m->flags & LLMHF_INJECTED) && (wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN || wp == WM_LBUTTONDOWN)) {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             bool alt   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
             bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            if (!shift && !alt && !ctrl) {   // modifier combos are reserved for other modes
+            bool test = false;
+            if (!ctrl) {
+                if (wp == WM_RBUTTONDOWN) test = true;
+                else if (wp == WM_MBUTTONDOWN) test = !g_set.noMiddle;
+                else test = shift || alt;          // plain left clicks are never touched
+            }
+            if (test) {
                 HWND under = WindowFromPoint(m->pt);
                 HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
                 if (root && IsRollable(root)) {
-                    bool cap = IsCaptionAt(root, m->pt);
-                    if (!cap && under != root) cap = IsCaptionAt(under, m->pt);
-                    if (cap) {
-                        swallowUp = true;
-                        PostMessageW(g_main, WM_APP_ROLL, (WPARAM)root, 0);
+                    LRESULT ht = HitTestAt(root, m->pt);
+                    if (!IsInteresting(ht) && under != root) ht = HitTestAt(under, m->pt);
+                    int act = DecideAction(wp, ht, shift, alt);
+                    if (act) {
+                        swallowUp = (wp == WM_RBUTTONDOWN) ? WM_RBUTTONUP : (wp == WM_MBUTTONDOWN) ? WM_MBUTTONUP : WM_LBUTTONUP;
+                        PostMessageW(g_main, WM_APP_ACTION, (WPARAM)act, (LPARAM)root);
                         return 1;
                     }
                 }
             }
-        } else if (wp == WM_RBUTTONUP && swallowUp) {
-            swallowUp = false;
-            return 1;
         }
     }
     return CallNextHookEx(g_mouseHook, code, wp, lp);
@@ -740,8 +1061,8 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
 // ---------------------------------------------------------------------------
 // Panel windows (settings / operations list) — owner drawn, scalable
 // ---------------------------------------------------------------------------
-enum ItemKind { K_CARD, K_HEAD, K_TEXT, K_TEXT_BOLD, K_TEXT_MUTED, K_CHECK, K_SEG, K_BTN, K_BTN_PRIMARY, K_LINK, K_TROW, K_THEAD, K_FOOTER };
-enum ItemId { I_NONE, I_SEG, I_FOLLOW, I_AUTO, I_HIDE, I_OK, I_CANCEL, I_ABOUT, I_CLOSE, I_GITHUB };
+enum ItemKind { K_CARD, K_HEAD, K_TEXT, K_TEXT_BOLD, K_TEXT_MUTED, K_CHECK, K_SEG, K_BTN, K_BTN_PRIMARY, K_LINK, K_TROW, K_THEAD, K_FOOTER, K_RADIO };
+enum ItemId { I_NONE, I_SEG, I_FOLLOW, I_AUTO, I_HIDE, I_OK, I_CANCEL, I_ABOUT, I_CLOSE, I_GITHUB, I_NOMIDDLE, I_TRAY_ICON, I_TRAY_MENU };
 
 struct Item {
     ItemKind kind; RECT rc; std::wstring text, sub; int id = I_NONE; int value = 0;
@@ -791,9 +1112,25 @@ static void BuildSettings(Panel* p) {
     p->items.push_back(a); p->items.push_back(h);
     y = cy + 104 + 12;
 
-    // 今後のバージョン
+    // 操作
+    cy = y;
+    p->items.push_back(MkItem(K_CARD, x, cy, cw, 74));
+    p->items.push_back(MkItem(K_HEAD, x + 14, cy + 12, cw - 28, 18, L"操作"));
+    Item nm = MkItem(K_CHECK, x + 14, cy + 38, cw - 28, 24, L"マウスの中ボタンを使わない（Shift＋右クリックで代用）", I_NOMIDDLE); nm.on = s.noMiddle;
+    p->items.push_back(nm);
+    y = cy + 74 + 12;
+
+    // トレイへ最小化したとき
+    cy = y;
+    p->items.push_back(MkItem(K_CARD, x, cy, cw, 74));
+    p->items.push_back(MkItem(K_HEAD, x + 14, cy + 12, cw - 28, 18, L"トレイへ最小化したとき"));
+    Item ti = MkItem(K_RADIO, x + 14, cy + 38, 170, 24, L"アイコンで表示", I_TRAY_ICON); ti.on = !s.trayAsMenu;
+    Item tm = MkItem(K_RADIO, x + 14 + 190, cy + 38, 190, 24, L"メニューにまとめる", I_TRAY_MENU); tm.on = s.trayAsMenu;
+    p->items.push_back(ti); p->items.push_back(tm);
+    y = cy + 74 + 12;
+
     p->items.push_back(MkItem(K_TEXT_MUTED, x + 2, y, cw - 4, 40,
-        L"中ボタンの設定・半透明の濃さ・トレイへの最小化は、次のバージョンで追加します。"));
+        L"半透明は、Windows の「個人用設定 → 色 → 透明効果」がオンのときだけ使えます（濃さは 80%）。"));
     y += 40 + 12;
 
     // footer
@@ -807,19 +1144,20 @@ static void BuildSettings(Panel* p) {
 
 static void BuildAbout(Panel* p) {
     p->items.clear();
-    int W = 520, x = 16, cw = W - 32, y = 16;
+    int W = 580, x = 16, cw = W - 32, y = 16;
     struct Row { const wchar_t* op; const wchar_t* act; bool future; };
     const Row rows[] = {
         { L"タイトルバーを右クリック",       L"ウィンドウを巻き上げる",              false },
         { L"巻き上げたバーを右クリック",     L"元に戻す（ダブルクリックでも可）",     false },
         { L"巻き上げたバーをドラッグ",       L"移動（戻したときに位置が反映）",       false },
         { L"巻き上げたバーで Alt＋F4",       L"元に戻してからアプリを閉じる",         false },
-        { L"タイトルバーを中クリック",       L"半透明にする／元に戻す",              true },
-        { L"Shift＋タイトルバーを左クリック", L"いちばん後ろへ送る",                  true },
-        { L"閉じるボタンを右クリック",       L"いちばん後ろへ送る",                  true },
-        { L"閉じるボタンを中クリック",       L"常に手前に表示する／やめる",          true },
-        { L"最小化ボタンを中クリック",       L"タスクトレイへ最小化する",            true },
-        { L"Alt＋各ボタンを左クリック",      L"すべてのウィンドウに適用する",        true },
+        { L"タイトルバーを中クリック",       L"半透明にする／元に戻す",              false },
+        { L"Shift＋タイトルバーを左クリック", L"いちばん後ろへ送る",                  false },
+        { L"閉じるボタンを右クリック",       L"いちばん後ろへ送る",                  false },
+        { L"閉じるボタンを中クリック",       L"常に手前に表示する／やめる",          false },
+        { L"最小化ボタンを中クリック",       L"タスクトレイへ最小化する",            false },
+        { L"Alt＋タイトルバーを右クリック",  L"すべて巻き上げる（バー側ではすべて戻す）", false },
+        { L"Alt＋最小化・最大化・閉じるを左クリック", L"すべてのウィンドウに適用する", false },
     };
     int n = (int)(sizeof(rows) / sizeof(rows[0]));
     int th = 32 + n * 34;
@@ -832,7 +1170,7 @@ static void BuildAbout(Panel* p) {
     }
     y += th + 10;
     p->items.push_back(MkItem(K_TEXT_MUTED, x + 2, y, cw - 4, 40,
-        L"グレーの操作は次のバージョンで追加予定です。中ボタンの操作は「Shift＋右クリック」でも代用できるようにします。"));
+        L"中ボタンの操作は、すべて「Shift＋右クリック」でも代用できます。半透明は Windows の「透明効果」がオンのときだけ使えます。"));
     y += 40 + 10;
 
     int iy = y;
@@ -952,6 +1290,23 @@ static void PaintPanel(HWND hwnd, Panel* p) {
                 DrawTextIn(dc, it.text, tr, p->fN, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 break;
             }
+            case K_RADIO: {
+                int bx = (int)(16 * s);
+                float cx0 = (float)r.left, cy0 = (float)(r.top + (r.bottom - r.top - bx) / 2);
+                Gdiplus::SolidBrush wb(GC(C_CARD));
+                g.FillEllipse(&wb, cx0, cy0, (float)bx - 1, (float)bx - 1);
+                Gdiplus::Pen pen(GC(it.on ? C_BLUE : (hov ? C_BLUE : C_MUTED)), (float)(s >= 1.5 ? 1.5 : 1.0));
+                g.DrawEllipse(&pen, cx0 + 0.5f, cy0 + 0.5f, (float)bx - 2, (float)bx - 2);
+                if (it.on) {
+                    Gdiplus::SolidBrush bb(GC(hov ? C_BLUE_HV : C_BLUE));
+                    float d = bx * 0.5f;
+                    g.FillEllipse(&bb, cx0 + (bx - 1 - d) / 2, cy0 + (bx - 1 - d) / 2, d, d);
+                }
+                g.Flush();
+                RECT tr = r; tr.left += bx + (int)(8 * s);
+                DrawTextIn(dc, it.text, tr, p->fN, C_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                break;
+            }
             case K_SEG: {
                 COLORREF fill = it.on ? C_BLUE : (hov ? C_HOVER : C_PANEL);
                 COLORREF border = it.on ? C_BLUE_ACT : (hov ? C_BLUE : C_BORDER);
@@ -979,7 +1334,7 @@ static void PaintPanel(HWND hwnd, Panel* p) {
                     RECT line = { r.left + 1, r.bottom - 1, r.right - 1, r.bottom };
                     HBRUSH lb = CreateSolidBrush(head ? C_BORDER : RGB(0xec,0xec,0xec)); FillRect(dc, &line, lb); DeleteObject(lb);
                 }
-                int c1 = r.left + (int)(220 * s);
+                int c1 = r.left + (int)(290 * s);
                 RECT a = { r.left + (int)(12 * s), r.top, c1 - (int)(6 * s), r.bottom };
                 RECT b = { c1 + (int)(12 * s), r.top, r.right - (int)(12 * s), r.bottom };
                 HFONT fa = head ? p->fSB : p->fB, fb = head ? p->fSB : p->fN;
@@ -999,7 +1354,7 @@ static void PaintPanel(HWND hwnd, Panel* p) {
 
 static bool Clickable(const Item& it) {
     if (!it.enabled) return false;
-    switch (it.kind) { case K_CHECK: case K_SEG: case K_BTN: case K_BTN_PRIMARY: case K_LINK: return true; default: return false; }
+    switch (it.kind) { case K_CHECK: case K_RADIO: case K_SEG: case K_BTN: case K_BTN_PRIMARY: case K_LINK: return true; default: return false; }
 }
 
 static int HitItem(HWND hwnd, Panel* p, int x, int y) {
@@ -1018,10 +1373,12 @@ static void UpdateTrayIcon();
 
 static void ApplySettings(const Settings& s) {
     bool scaleChanged = (s.sizePct != g_set.sizePct || s.followDpi != g_set.followDpi);
+    bool trayModeChanged = (s.trayAsMenu != g_set.trayAsMenu);
     g_set = s;
     g_forceIcon = false;        // honour "hide tray icon" right away
     SaveSettings();
     ApplyAutoStart();
+    if (trayModeChanged) ApplyTrayMode();
     UpdateTrayIcon();
     if (scaleChanged) {
         RelayoutBars();
@@ -1038,6 +1395,9 @@ static void PanelActivate(HWND hwnd, Panel* p, int id, int value) {
     case I_FOLLOW: p->temp.followDpi = !p->temp.followDpi; BuildSettings(p); ResizePanel(hwnd, p); break;
     case I_AUTO: p->temp.autoStart = !p->temp.autoStart; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
     case I_HIDE: p->temp.hideIcon = !p->temp.hideIcon; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
+    case I_NOMIDDLE: p->temp.noMiddle = !p->temp.noMiddle; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
+    case I_TRAY_ICON: p->temp.trayAsMenu = false; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
+    case I_TRAY_MENU: p->temp.trayAsMenu = true; BuildSettings(p); InvalidateRect(hwnd, nullptr, FALSE); break;
     case I_OK: { Settings s = p->temp; DestroyWindow(hwnd); ApplySettings(s); break; }
     case I_CANCEL: case I_CLOSE: DestroyWindow(hwnd); break;
     case I_ABOUT: ShowAbout(); break;
@@ -1142,7 +1502,8 @@ static void ShowAbout() {
 // Tray icon and main window
 // ---------------------------------------------------------------------------
 static void UpdateTrayIcon() {
-    bool want = !g_set.hideIcon || g_forceIcon;
+    // Keep our icon while windows are listed in its menu, even if "hide icon" is on.
+    bool want = !g_set.hideIcon || g_forceIcon || (g_set.trayAsMenu && !g_trayed.empty());
     NOTIFYICONDATAW nid = { sizeof(nid) };
     nid.hWnd = g_main; nid.uID = ID_TRAY;
     if (want && !g_trayShown) {
@@ -1159,10 +1520,15 @@ static void UpdateTrayIcon() {
 
 static void ShowTrayMenu() {
     HMENU m = CreatePopupMenu();
+    if (g_set.trayAsMenu && !g_trayed.empty()) {
+        for (size_t i = 0; i < g_trayed.size() && i < 200; i++)
+            AppendMenuW(m, MF_STRING, IDM_TRAYED_BASE + i, TrayLabel(g_trayed[i]).c_str());
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    }
     AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"設定…");
     AppendMenuW(m, MF_STRING, IDM_ABOUT, L"操作一覧…\tF1");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_rolled.empty() ? MF_GRAYED : 0), IDM_RESTOREALL, L"すべて元に戻す");
+    AppendMenuW(m, MF_STRING | ((g_rolled.empty() && g_trayed.empty()) ? MF_GRAYED : 0), IDM_RESTOREALL, L"すべて元に戻す");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"終了");
     SetMenuDefaultItem(m, IDM_SETTINGS, FALSE);
@@ -1177,15 +1543,43 @@ static void QuitApp() {
     if (g_settingsWnd) DestroyWindow(g_settingsWnd);
     if (g_aboutWnd) DestroyWindow(g_aboutWnd);
     UnrollAll();
+    RestoreAllTrayed();
+    RestoreAllTranslucent();
     DestroyWindow(g_main);
 }
 
 static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == g_msgTaskbarCreated && g_msgTaskbarCreated) { g_trayShown = false; UpdateTrayIcon(); return 0; }
+    if (msg == g_msgTaskbarCreated && g_msgTaskbarCreated) {
+        g_trayShown = false; UpdateTrayIcon();
+        for (auto* t : g_trayed) { t->hasIcon = false; if (!g_set.trayAsMenu) AddTrayedIcon(t); }
+        return 0;
+    }
     switch (msg) {
     case WM_APP_ROLL: RollWindow((HWND)wp); return 0;
+    case WM_APP_ACTION: DoAction((int)wp, (HWND)lp); return 0;
+    case WM_APP_TRAYWIN: {
+        Trayed* t = FindTrayedById((UINT)wp);
+        if (t) {
+            switch (LOWORD(lp)) {
+            case WM_LBUTTONUP: RestoreTrayed(t, true); break;
+            case WM_RBUTTONUP: case WM_CONTEXTMENU: ShowTrayedMenu(t); break;
+            }
+        }
+        return 0;
+    }
+    case WM_TIMER:
+        if (wp == MAIN_TIMER) {
+            for (auto* t : std::vector<Trayed*>(g_trayed))
+                if (!IsWindow(t->target) || IsWindowVisible(t->target)) RemoveTrayed(t);   // gone, or the app showed itself
+            bool changed = false;
+            for (int i = (int)g_trans.size() - 1; i >= 0; i--)
+                if (!IsWindow(g_trans[i].h)) { g_trans.erase(g_trans.begin() + i); changed = true; }
+            if (changed) SaveRolledState();
+        }
+        return 0;
     case WM_DWMCOLORIZATIONCOLORCHANGED: case WM_SETTINGCHANGE: case WM_SYSCOLORCHANGE:
         for (auto* r : g_rolled) InvalidateRect(r->bar, nullptr, FALSE);
+        if (!g_trans.empty() && !TransparencyEnabled()) RestoreAllTranslucent();   // transparency effects turned off
         break;
     case WM_APP_TRAY:
         switch (LOWORD(lp)) {
@@ -1200,17 +1594,24 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         case IDM_SETTINGS: ShowSettings(); break;
         case IDM_ABOUT: ShowAbout(); break;
-        case IDM_RESTOREALL: UnrollAll(); break;
+        case IDM_RESTOREALL: UnrollAll(); RestoreAllTrayed(); break;
         case IDM_EXIT: QuitApp(); break;
+        default:
+            if (LOWORD(wp) >= IDM_TRAYED_BASE && LOWORD(wp) < IDM_TRAYED_BASE + 200) {
+                size_t i = LOWORD(wp) - IDM_TRAYED_BASE;
+                if (i < g_trayed.size()) RestoreTrayed(g_trayed[i], true);
+            }
         }
         return 0;
     case WM_QUERYENDSESSION:
         RestoreAllHidden();      // let apps save their real (visible) state
         return TRUE;
     case WM_ENDSESSION:
-        if (wp) { UnrollAll(); }
+        if (wp) { UnrollAll(); RestoreAllTrayed(); RestoreAllTranslucent(); }
         return 0;
     case WM_DESTROY: {
+        KillTimer(hwnd, MAIN_TIMER);
+        for (auto* t : g_trayed) RemoveTrayedIcon(t);
         NOTIFYICONDATAW nid = { sizeof(nid) }; nid.hWnd = hwnd; nid.uID = ID_TRAY;
         if (g_trayShown) Shell_NotifyIconW(NIM_DELETE, &nid);
         PostQuitMessage(0);
@@ -1281,6 +1682,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     ChangeWindowMessageFilterEx(g_main, g_msgTaskbarCreated, MSGFLT_ALLOW, nullptr);
 
     UpdateTrayIcon();
+    SetTimer(g_main, MAIN_TIMER, 1000, nullptr);
 
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, hInst, 0);
     if (!g_mouseHook) {
