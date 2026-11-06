@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.3.4
+// シンプル WinRoll ver 1.3.5
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.3.4";
+static const wchar_t* APP_VERSION   = L"1.3.5";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -1060,11 +1060,16 @@ static LRESULT CALLBACK BarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (r) UnrollWindow(r, true);
             return 0;
         case SC_CLOSE:
-            if (r) CloseTargetFromBar(r);
+            // SC_CLOSE can also be sent by other programs (e.g. Task Manager "End task"),
+            // so it only unrolls. The app itself is closed only by a real Alt+F4 key press (below).
+            if (r) UnrollWindow(r, false);
             return 0;
         case SC_MOVE: break;
         case SC_KEYMENU: return 0;
         }
+        break;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_F4 && r) { CloseTargetFromBar(r); return 0; }   // real Alt+F4 on the bar
         break;
     // A plain WM_CLOSE also comes from Task Manager ("End task") or other programs:
     // only unroll, never close the user's app. Alt+F4 / taskbar "Close window" arrive as SC_CLOSE above.
