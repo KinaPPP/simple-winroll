@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.3.3
+// シンプル WinRoll ver 1.3.4
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.3.3";
+static const wchar_t* APP_VERSION   = L"1.3.4";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -1066,7 +1066,9 @@ static LRESULT CALLBACK BarProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case SC_KEYMENU: return 0;
         }
         break;
-    case WM_CLOSE: if (r) CloseTargetFromBar(r); return 0;
+    // A plain WM_CLOSE also comes from Task Manager ("End task") or other programs:
+    // only unroll, never close the user's app. Alt+F4 / taskbar "Close window" arrive as SC_CLOSE above.
+    case WM_CLOSE: if (r) UnrollWindow(r, false); return 0;
     case WM_TIMER:
         if (wp == BAR_TIMER && r) {
             if (!IsWindow(r->target)) { RemoveRolled(r); return 0; }       // app has exited
@@ -1814,6 +1816,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_APP_ROLL: RollWindow((HWND)wp); return 0;
     case WM_APP_ACTION: DoAction((int)wp, (HWND)lp); return 0;
+    case WM_CLOSE: QuitApp(); return 0;   // e.g. Task Manager "End task": restore everything first
     case WM_APP_TRAYWIN: {
         Trayed* t = FindTrayedById((UINT)wp);
         if (t) {
