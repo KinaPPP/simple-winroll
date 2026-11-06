@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.4.0
+// シンプル WinRoll ver 1.4.1
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.4.0";
+static const wchar_t* APP_VERSION   = L"1.4.1";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -114,7 +114,7 @@ static DWORD g_hookThreadId;
 static HANDLE g_hookThread;
 static std::atomic<bool> g_noMiddleFlag{false};   // copy of g_set.noMiddle for the hook thread
 static std::atomic<bool> g_enabled{true};         // tray menu "有効": when off, every click passes through
-static HICON g_grayIconSmall;                     // tray icon while paused
+static HICON g_trayIconOn;                        // tray icon while enabled: a rolled-up bar (paused: a normal window, like the original)
 static Settings g_set;
 static std::vector<Rolled*> g_rolled;
 static bool g_trayShown = false;
@@ -1939,31 +1939,6 @@ static void ShowGuide() {
     SetForegroundWindow(hw);
 }
 
-// Gray copy of an icon, for the tray while paused.
-static HICON MakeGrayIcon(HICON src) {
-    ICONINFO ii; if (!src || !GetIconInfo(src, &ii)) return nullptr;
-    BITMAP bm; GetObject(ii.hbmColor, sizeof(bm), &bm);
-    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = bm.bmWidth; bi.bmiHeader.biHeight = -bm.bmHeight;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    std::vector<DWORD> px((size_t)bm.bmWidth * bm.bmHeight);
-    HDC dc = GetDC(nullptr);
-    GetDIBits(dc, ii.hbmColor, 0, bm.bmHeight, px.data(), &bi, DIB_RGB_COLORS);
-    for (auto& p : px) {
-        BYTE a = (BYTE)(p >> 24), r = (BYTE)(p >> 16), g = (BYTE)(p >> 8), b = (BYTE)p;
-        BYTE y = (BYTE)((r * 30 + g * 59 + b * 11) / 100);
-        y = (BYTE)(y + (255 - y) / 3);                    // a little lighter
-        a = (BYTE)(a * 0.7);                               // and faded
-        p = ((DWORD)a << 24) | ((DWORD)y << 16) | ((DWORD)y << 8) | y;
-    }
-    HBITMAP col = CreateDIBitmap(dc, &bi.bmiHeader, CBM_INIT, px.data(), &bi, DIB_RGB_COLORS);
-    ReleaseDC(nullptr, dc);
-    ICONINFO ni = ii; ni.hbmColor = col;
-    HICON out = CreateIconIndirect(&ni);
-    DeleteObject(col); DeleteObject(ii.hbmColor); DeleteObject(ii.hbmMask);
-    return out;
-}
-
 // ---------------------------------------------------------------------------
 // Tray icon and main window
 // ---------------------------------------------------------------------------
@@ -1975,7 +1950,7 @@ static void UpdateTrayIcon() {
     if (want) {
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_APP_TRAY;
-        nid.hIcon = (g_enabled || !g_grayIconSmall) ? g_appIconSmall : g_grayIconSmall;
+        nid.hIcon = (g_enabled && g_trayIconOn) ? g_trayIconOn : g_appIconSmall;
         wcscpy_s(nid.szTip, g_enabled ? L"シンプル WinRoll" : L"シンプル WinRoll（停止中）");
         if (g_trayShown) Shell_NotifyIconW(NIM_MODIFY, &nid);
         else g_trayShown = Shell_NotifyIconW(NIM_ADD, &nid) != FALSE;
@@ -2198,7 +2173,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     g_appIconSmall = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     g_appIconBig   = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0);
-    g_grayIconSmall = MakeGrayIcon(g_appIconSmall);
+    g_trayIconOn = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(2), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.hInstance = hInst; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
