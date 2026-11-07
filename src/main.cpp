@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.4.1
+// シンプル WinRoll ver 1.4.2
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.4.1";
+static const wchar_t* APP_VERSION   = L"1.4.2";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -305,6 +305,13 @@ static HFONT MakeFont(double px, bool bold) {
 static bool IsOurWindow(HWND h) {
     DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
     return pid == GetCurrentProcessId();
+}
+
+// Windows only lets the foreground process move focus; when anyone else tries, it flashes
+// the taskbar button instead. So we only activate a window while we are in the foreground.
+static bool WeAreForeground() {
+    HWND f = GetForegroundWindow();
+    return f && IsOurWindow(f);
 }
 
 static bool ClassIs(HWND h, const wchar_t* name) {
@@ -617,7 +624,7 @@ static void RollWindow(HWND h) {
 
     SaveRolledState();           // record BEFORE hiding, so a crash right now is recoverable
     ShowWindowAsync(h, SW_HIDE);
-    if (wasForeground) SetForegroundWindow(r->bar);
+    (void)wasForeground;   // no SetForegroundWindow here: it made the taskbar flash (Windows picks the next window itself)
 }
 
 static void UnrollWindow(Rolled* r, bool activate) {
@@ -635,7 +642,7 @@ static void UnrollWindow(Rolled* r, bool activate) {
         HWND after = front ? front : (barTop ? HWND_TOPMOST : HWND_TOP);
         SetWindowPos(t, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
         ShowWindowAsync(t, activate ? SW_SHOW : SW_SHOWNA);
-        if (activate) SetForegroundWindow(t);
+        if (activate && WeAreForeground()) SetForegroundWindow(t);
     }
     RemoveRolled(r);
 }
@@ -859,7 +866,7 @@ static void RestoreTrayed(Trayed* t, bool activate) {
     HWND h = t->target;
     if (IsWindow(h)) {
         ShowWindowAsync(h, SW_SHOW);
-        if (activate) SetForegroundWindow(h);
+        if (activate && WeAreForeground()) SetForegroundWindow(h);
     }
     RemoveTrayed(t);
 }
@@ -2009,7 +2016,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         Trayed* t = FindTrayedById((UINT)wp);
         if (t) {
             switch (LOWORD(lp)) {
-            case WM_LBUTTONUP: RestoreTrayed(t, true); break;
+            case WM_LBUTTONUP: SetForegroundWindow(g_main); RestoreTrayed(t, true); break;   // a tray click lets us take the foreground
             case WM_RBUTTONUP: case WM_CONTEXTMENU: ShowTrayedMenu(t); break;
             }
         }
