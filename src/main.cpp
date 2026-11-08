@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.4.5
+// シンプル WinRoll ver 1.5.0
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.4.5";
+static const wchar_t* APP_VERSION   = L"1.5.0";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -58,7 +58,7 @@ enum {
     ID_TRAY = 1,
     IDM_SETTINGS = 100, IDM_ABOUT, IDM_RESTOREALL, IDM_EXIT,
     IDM_TW_RESTORE = 300, IDM_TW_CLOSE,
-    IDM_ENABLE = 400, IDM_VERSION,
+    IDM_ENABLE = 400, IDM_VERSION, IDM_DIAG,
     IDM_TRAYED_BASE = 1000,          // + index (tray "menu" mode)
 };
 enum Action { A_ROLL = 1, A_ROLL_ALL, A_TRANSLUCENT, A_BACK, A_TOPMOST, A_TRAY, A_MIN_ALL, A_MAX_ALL, A_CLOSE_ALL };
@@ -114,7 +114,8 @@ static HHOOK g_mouseHook;              // owned by the hook thread
 static DWORD g_hookThreadId;
 static HANDLE g_hookThread;
 static std::atomic<bool> g_noMiddleFlag{false};   // copy of g_set.noMiddle for the hook thread
-static std::atomic<bool> g_enabled{true};         // tray menu "有効": when off, every click passes through
+static std::atomic<bool> g_enabled{true};
+static std::atomic<bool> g_diagMode{false};        // tray menu "調査モード": Ctrl+Shift+Right click shows hit-test info (off at every start)         // tray menu "有効": when off, every click passes through
 static HICON g_trayIconOn;                        // tray icon while enabled: a rolled-up bar (paused: a normal window, like the original)
 static Settings g_set;
 static std::vector<Rolled*> g_rolled;
@@ -1206,7 +1207,7 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             bool alt   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
             bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            if (ctrl && shift && !alt && wp == WM_RBUTTONDOWN) {   // diagnostic: what is under the mouse?
+            if (g_diagMode && ctrl && shift && !alt && wp == WM_RBUTTONDOWN) {   // diagnostic: what is under the mouse?
                 DiagInfo* d = new DiagInfo();
                 d->under = WindowFromPoint(m->pt);
                 d->root = d->under ? GetAncestor(d->under, GA_ROOT) : nullptr;
@@ -2026,6 +2027,7 @@ static void ShowTrayMenu() {
     AppendMenuW(m, MF_POPUP | (g_trayed.empty() ? MF_GRAYED : 0), (UINT_PTR)sub, L"最小化したウィンドウ");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_enabled ? MF_CHECKED : 0), IDM_ENABLE, L"有効");
+    AppendMenuW(m, MF_STRING | (g_diagMode ? MF_CHECKED : 0), IDM_DIAG, L"調査モード（Ctrl＋Shift＋右クリック）");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_SETTINGS, L"設定…");
     AppendMenuW(m, MF_STRING, IDM_ABOUT, L"操作一覧…");
@@ -2119,6 +2121,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_ABOUT: ShowAbout(); break;
         case IDM_VERSION: ShowGuide(); break;
         case IDM_ENABLE: g_enabled = !g_enabled; UpdateTrayIcon(); break;
+        case IDM_DIAG: g_diagMode = !g_diagMode; break;
         case IDM_RESTOREALL: UnrollAll(); RestoreAllTrayed(); break;
         case IDM_EXIT: QuitApp(); break;
         default:
