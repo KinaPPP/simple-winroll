@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.4.4
+// シンプル WinRoll ver 1.4.5
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.4.4";
+static const wchar_t* APP_VERSION   = L"1.4.5";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -1172,15 +1172,26 @@ static int DecideAction(WPARAM btn, LRESULT ht, bool shift, bool alt) {
 
 // Title bars are always at the top of a window. Some apps answer "caption" for the whole
 // window (e.g. Windows Terminal), so a click must also be near the top edge to count.
-static const int TOP_BAND = 80;   // px at 100% scale
-static int TopOffset(HWND root, POINT pt, int* bandOut) {
+static const int TOP_BAND = 80;        // px at 100% scale
+static const int TOP_BAND_STRICT = 40; // for apps that call their whole window a caption
+static int TopOffset(HWND root, POINT pt, int* bandOut, bool strict = false) {
     RECT r = VisibleRect(root);
     UINT dpi = GetDpiForWindow(root); if (!dpi) dpi = 96;
-    if (bandOut) *bandOut = MulDiv(TOP_BAND, dpi, 96);
+    if (bandOut) *bandOut = MulDiv(strict ? TOP_BAND_STRICT : TOP_BAND, dpi, 96);
     return pt.y - r.top;
 }
-static bool InTopBand(HWND root, POINT pt) {
-    int band = 0, dy = TopOffset(root, pt, &band);
+
+static LRESULT HitTestAt(HWND h, POINT pt);
+
+// Does this window answer "caption" even in the middle of its body?
+static bool ClaimsCaptionEverywhere(HWND root) {
+    RECT r = VisibleRect(root);
+    POINT mid = { (r.left + r.right) / 2, r.top + (r.bottom - r.top) * 3 / 5 };
+    return HitTestAt(root, mid) == HTCAPTION;
+}
+
+static bool InTopBand(HWND root, POINT pt, bool strict) {
+    int band = 0, dy = TopOffset(root, pt, &band, strict);
     return dy >= 0 && dy < band;
 }
 
@@ -1201,7 +1212,8 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                 d->root = d->under ? GetAncestor(d->under, GA_ROOT) : nullptr;
                 d->htUnder = (d->under && !IsHungAppWindow(d->under)) ? HitTestAt(d->under, m->pt) : HTNOWHERE;
                 d->htRoot = (d->root && d->root != d->under && !IsHungAppWindow(d->root)) ? HitTestAt(d->root, m->pt) : d->htUnder;
-                d->dy = d->root ? TopOffset(d->root, m->pt, &d->band) : 0;
+                bool strict = d->root && !IsHungAppWindow(d->root) && ClaimsCaptionEverywhere(d->root);
+                d->dy = d->root ? TopOffset(d->root, m->pt, &d->band, strict) : 0;
                 if (!PostMessageW(g_main, WM_APP_DIAG, 0, (LPARAM)d)) delete d;
                 swallowUp = WM_RBUTTONUP;
                 return 1;
@@ -1223,7 +1235,12 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                     DWORD t0 = GetTickCount();
                     LRESULT ht = HitTestAt(under, m->pt);
                     if (under != root && ht == HTTRANSPARENT && GetTickCount() - t0 < 30) ht = HitTestAt(root, m->pt);
-                    if (IsInteresting(ht) && !InTopBand(root, m->pt)) ht = HTCLIENT;   // not near the top: not a real title bar
+                    if (IsInteresting(ht)) {
+                        // Not near the top: not a real title bar. If the app says "caption" for its
+                        // whole window (e.g. Windows Terminal), only the strip at the very top counts.
+                        bool strict = (ht == HTCAPTION) && GetTickCount() - t0 < 60 && ClaimsCaptionEverywhere(root);
+                        if (!InTopBand(root, m->pt, strict)) ht = HTCLIENT;
+                    }
                     int act = DecideAction(wp, ht, shift, alt);
                     if (act) {
                         swallowUp = (wp == WM_RBUTTONDOWN) ? WM_RBUTTONUP : (wp == WM_MBUTTONDOWN) ? WM_MBUTTONUP : WM_LBUTTONUP;
