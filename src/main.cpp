@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.4.2
+// シンプル WinRoll ver 1.4.3
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.4.2";
+static const wchar_t* APP_VERSION   = L"1.4.3";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -1188,10 +1188,13 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                 HWND under = WindowFromPoint(m->pt);
                 HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
                 if (root && !IsHungAppWindow(root) && IsRollable(root)) {   // never wait on a hung app
+                    // Ask the window that actually receives the click (the one under the mouse).
+                    // A parent may answer "caption" even for areas covered by a child window
+                    // (e.g. the text area of Windows Terminal), so it is asked only when the
+                    // child lets the click pass through (HTTRANSPARENT), as Electron drag areas do.
                     DWORD t0 = GetTickCount();
-                    LRESULT ht = HitTestAt(root, m->pt);
-                    // Ask the child window only if the first answer came back quickly.
-                    if (!IsInteresting(ht) && under != root && GetTickCount() - t0 < 30) ht = HitTestAt(under, m->pt);
+                    LRESULT ht = HitTestAt(under, m->pt);
+                    if (under != root && ht == HTTRANSPARENT && GetTickCount() - t0 < 30) ht = HitTestAt(root, m->pt);
                     int act = DecideAction(wp, ht, shift, alt);
                     if (act) {
                         swallowUp = (wp == WM_RBUTTONDOWN) ? WM_RBUTTONUP : (wp == WM_MBUTTONDOWN) ? WM_MBUTTONUP : WM_LBUTTONUP;
