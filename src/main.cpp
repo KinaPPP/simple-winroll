@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.4.3
+// シンプル WinRoll ver 1.4.4
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.4.3";
+static const wchar_t* APP_VERSION   = L"1.4.4";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -52,6 +52,7 @@ enum {
     WM_APP_REACTIVATE = WM_APP + 3,   // a second copy was launched
     WM_APP_ACTION     = WM_APP + 4,   // wParam = Action, lParam = HWND
     WM_APP_TRAYWIN    = WM_APP + 5,   // a window minimized to the tray (wParam = icon id)
+    WM_APP_DIAG       = WM_APP + 6,   // Ctrl+Shift+Right click: show what is under the mouse (lParam = DiagInfo*)
 };
 enum {
     ID_TRAY = 1,
@@ -1169,6 +1170,22 @@ static int DecideAction(WPARAM btn, LRESULT ht, bool shift, bool alt) {
     return 0;
 }
 
+// Title bars are always at the top of a window. Some apps answer "caption" for the whole
+// window (e.g. Windows Terminal), so a click must also be near the top edge to count.
+static const int TOP_BAND = 80;   // px at 100% scale
+static int TopOffset(HWND root, POINT pt, int* bandOut) {
+    RECT r = VisibleRect(root);
+    UINT dpi = GetDpiForWindow(root); if (!dpi) dpi = 96;
+    if (bandOut) *bandOut = MulDiv(TOP_BAND, dpi, 96);
+    return pt.y - r.top;
+}
+static bool InTopBand(HWND root, POINT pt) {
+    int band = 0, dy = TopOffset(root, pt, &band);
+    return dy >= 0 && dy < band;
+}
+
+struct DiagInfo { HWND under, root; LRESULT htUnder, htRoot; int dy, band; };
+
 static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
     static WPARAM swallowUp = 0;   // the button-up message that belongs to a click we handled
     if (code == HC_ACTION) {
@@ -1178,6 +1195,17 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             bool alt   = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
             bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            if (ctrl && shift && !alt && wp == WM_RBUTTONDOWN) {   // diagnostic: what is under the mouse?
+                DiagInfo* d = new DiagInfo();
+                d->under = WindowFromPoint(m->pt);
+                d->root = d->under ? GetAncestor(d->under, GA_ROOT) : nullptr;
+                d->htUnder = (d->under && !IsHungAppWindow(d->under)) ? HitTestAt(d->under, m->pt) : HTNOWHERE;
+                d->htRoot = (d->root && d->root != d->under && !IsHungAppWindow(d->root)) ? HitTestAt(d->root, m->pt) : d->htUnder;
+                d->dy = d->root ? TopOffset(d->root, m->pt, &d->band) : 0;
+                if (!PostMessageW(g_main, WM_APP_DIAG, 0, (LPARAM)d)) delete d;
+                swallowUp = WM_RBUTTONUP;
+                return 1;
+            }
             bool test = false;
             if (!ctrl) {
                 if (wp == WM_RBUTTONDOWN) test = true;
@@ -1195,6 +1223,7 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                     DWORD t0 = GetTickCount();
                     LRESULT ht = HitTestAt(under, m->pt);
                     if (under != root && ht == HTTRANSPARENT && GetTickCount() - t0 < 30) ht = HitTestAt(root, m->pt);
+                    if (IsInteresting(ht) && !InTopBand(root, m->pt)) ht = HTCLIENT;   // not near the top: not a real title bar
                     int act = DecideAction(wp, ht, shift, alt);
                     if (act) {
                         swallowUp = (wp == WM_RBUTTONDOWN) ? WM_RBUTTONUP : (wp == WM_MBUTTONDOWN) ? WM_MBUTTONUP : WM_LBUTTONUP;
@@ -2014,6 +2043,25 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_APP_ROLL: RollWindow((HWND)wp); return 0;
     case WM_APP_ACTION: DoAction((int)wp, (HWND)lp); return 0;
+    case WM_APP_DIAG: {
+        DiagInfo* d = (DiagInfo*)lp;
+        if (!d) return 0;
+        auto htName = [](LRESULT h) -> std::wstring {
+            switch (h) {
+            case HTCLIENT: return L"本体"; case HTCAPTION: return L"タイトルバー"; case HTTRANSPARENT: return L"素通し";
+            case HTCLOSE: return L"閉じる"; case HTMINBUTTON: return L"最小化"; case HTMAXBUTTON: return L"最大化";
+            case HTNOWHERE: return L"応答なし";
+            default: { wchar_t b[16]; swprintf(b, 16, L"%d", (int)h); return b; }
+            }
+        };
+        auto cls = [](HWND h) -> std::wstring { wchar_t c[128] = L"-"; if (h) GetClassNameW(h, c, 128); return c; };
+        wchar_t l1[256], l2[256];
+        swprintf(l1, 256, L"真下：%ls（%ls）", cls(d->under).c_str(), htName(d->htUnder).c_str());
+        swprintf(l2, 256, L"親：%ls（%ls）／ 上端から %dpx（判定範囲 %dpx）", cls(d->root).c_str(), htName(d->htRoot).c_str(), d->dy, d->band);
+        delete d;
+        ShowNotice(l1, l2, false);
+        return 0;
+    }
     case WM_CLOSE: QuitApp(); return 0;   // e.g. Task Manager "End task": restore everything first
     case WM_APP_TRAYWIN: {
         Trayed* t = FindTrayedById((UINT)wp);
