@@ -1,4 +1,4 @@
-// シンプル WinRoll ver 1.5.0
+// シンプル WinRoll ver 1.5.1
 // (c) 2026 KINA  https://github.com/KinaPPP
 // Inspired by WinRoll (c) 2003-2004 Wil Palma. This is a new, separate program.
 
@@ -34,7 +34,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 static const wchar_t* APP_NAME      = L"シンプル WinRoll";
-static const wchar_t* APP_VERSION   = L"1.5.0";
+static const wchar_t* APP_VERSION   = L"1.5.1";
 static const wchar_t* MAIN_CLASS    = L"SimpleWinRoll.KINA.Main";
 static const wchar_t* BAR_CLASS     = L"SimpleWinRoll.KINA.Bar";
 static const wchar_t* PANEL_CLASS   = L"SimpleWinRoll.KINA.Panel";
@@ -581,6 +581,7 @@ static void ApplyBarAlpha(Rolled* r);
 
 static void RollWindow(HWND h) {
     if (!IsRollable(h) || FindByTarget(h)) return;
+    if (GetWindow(h, GW_OWNER)) return;   // never hide sub-windows (see the mouse hook)
 
     Rolled* r = new Rolled();
     r->target = h;
@@ -850,6 +851,7 @@ static void RemoveTrayed(Trayed* t) {
 
 static void TrayWindow(HWND h) {
     if (!IsRollable(h)) return;
+    if (GetWindow(h, GW_OWNER)) return;   // never hide sub-windows
     for (auto* t : g_trayed) if (t->target == h) return;
     Trayed* t = new Trayed();
     t->target = h;
@@ -1243,6 +1245,10 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                         if (!InTopBand(root, m->pt, strict)) ht = HTCLIENT;
                     }
                     int act = DecideAction(wp, ht, shift, alt);
+                    // Sub-windows (dialogs owned by another window) are never hidden: a bar cannot
+                    // keep the "always above its owner" link, and many apps leave them blank when
+                    // shown again. Let the click pass through so Windows' own menu appears.
+                    if ((act == A_ROLL || act == A_TRAY) && GetWindow(root, GW_OWNER)) act = 0;
                     if (act) {
                         swallowUp = (wp == WM_RBUTTONDOWN) ? WM_RBUTTONUP : (wp == WM_MBUTTONDOWN) ? WM_MBUTTONUP : WM_LBUTTONUP;
                         PostMessageW(g_main, WM_APP_ACTION, (WPARAM)act, (LPARAM)root);
